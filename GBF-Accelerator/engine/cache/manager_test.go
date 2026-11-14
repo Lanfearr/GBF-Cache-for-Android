@@ -1,0 +1,1038 @@
+package cache
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestCacheManager(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_cache_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+
+	// 1. Path traversal security checks
+	traversals := []string{
+		"../escape.png",
+		"assets/../../secret.txt",
+		"C:\\Windows\\win.ini",
+		"D:\\data\\file.png",
+		"\\\\server\\share\\data.png",
+	}
+	for _, p := range traversals {
+		if _, ok := mgr.resolvePath(p); ok {
+			t.Errorf("expected path %q to be rejected, but resolvePath returned true", p)
+		}
+	}
+
+	// 2. Save valid PNG asset
+	validPng := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	saved := mgr.Save("assets/test/hero.png", map[string]string{
+		"content-type": "image/png",
+		"etag":         "\"test-etag-1\"",
+	}, validPng)
+	if !saved {
+		t.Fatal("failed to save valid asset")
+	}
+
+	// Verify disk files exist: <file> and <file>.ext
+	diskFile := filepath.Join(tempDir, "assets", "test", "hero.png")
+	extFile := diskFile + ".ext"
+	if fi, err := os.Stat(diskFile); err != nil || fi.Size() == 0 {
+		t.Fatalf("asset disk file %s not found or empty", diskFile)
+	}
+	if fi, err := os.Stat(extFile); err != nil || fi.Size() == 0 {
+		t.Fatalf("asset .ext file %s not found or empty", extFile)
+	}
+
+	// 3. Retrieve from RAM
+	item, src := mgr.Get("assets/test/hero.png")
+	if item == nil || src != "RAM" {
+		t.Fatalf("expected RAM hit, got item=%v, src=%s", item, src)
+	}
+
+	// 4. Clear RAM and retrieve from Disk
+	mgr.ClearRAM()
+	itemDisk, srcDisk := mgr.Get("assets/test/hero.png")
+	if itemDisk == nil || srcDisk != "DISK" {
+		t.Fatalf("expected DISK hit, got item=%v, src=%s", itemDisk, srcDisk)
+	}
+
+	// 5. Plaintext with deceptive Content-Encoding: gzip in metadata must be stripped
+	plainText := []byte("console.log('plaintext');")
+	mgr.Save("assets/test/app.js", map[string]string{
+		"content-type":     "application/javascript",
+		"content-encoding": "gzip", // deceptive!
+	}, plainText)
+
+	// Manually corrupt .ext to have ce: gzip to simulate legacy ACGP or upstream bug
+	appExtPath := filepath.Join(tempDir, "assets", "test", "app.js.ext")
+	corruptMeta := map[string]interface{}{
+		"ct": "application/javascript",
+		"ce": "gzip",
+		"v":  1,
+	}
+	corruptBytes, _ := json.Marshal(corruptMeta)
+	_ = os.WriteFile(appExtPath, corruptBytes, 0644)
+
+	mgr.ClearRAM()
+	itemJs, _ := mgr.Get("assets/test/app.js")
+	if itemJs == nil {
+		t.Fatal("expected app.js to be retrieved")
+	}
+	if itemJs.ContentEncoding == "gzip" {
+		t.Error("plain text without 0x1f 0x8b magic bytes must NEVER have Content-Encoding: gzip (causes ERR_CONTENT_DECODING_FAILED)")
+	}
+
+	// 6. Genuine gzip data retains Content-Encoding: gzip
+	genuineGzip := gzipBytes([]byte("console.log('compressed');"))
+	mgr.Save("assets/test/compressed.js", map[string]string{
+		"content-type":     "application/javascript",
+		"content-encoding": "gzip",
+	}, genuineGzip)
+
+	mgr.ClearRAM()
+	itemGz, _ := mgr.Get("assets/test/compressed.js")
+	if itemGz == nil {
+		t.Fatal("expected compressed.js to be retrieved")
+	}
+	if itemGz.ContentEncoding != "gzip" {
+		t.Errorf("genuine gzip data must retain Content-Encoding: gzip, got %q", itemGz.ContentEncoding)
+	}
+
+	// 7. Audit repairs a corrupted asset only when its paired metadata proves ownership.
+	corruptRel := "assets/img/sp/ui/icon/weapon/w_1040001.png"
+	if !mgr.Save(corruptRel, map[string]string{"content-type": "image/png"}, validPng) {
+		t.Fatal("save audit fixture failed")
+	}
+	corruptFile := filepath.Join(tempDir, filepath.FromSlash(corruptRel))
+	fi, err := os.Stat(corruptFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(corruptFile, bytes.Repeat([]byte("x"), len(validPng)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(corruptFile, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	auditRes := mgr.AuditAndRepair()
+	if auditRes["ok"] != true || auditRes["corrupted"].(int) < 1 {
+		t.Errorf("expected confirmed corrupt file to be repaired, got %v", auditRes)
+	}
+	if _, err := os.Stat(corruptFile); !os.IsNotExist(err) {
+		t.Error("confirmed corrupt cache file should be removed")
+	}
+}
+
+func TestLegacyTamperedJSQuarantine(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_quarantine_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+
+	// 1. Verify quarantine triggers on tampered file
+	tamperedFile := filepath.Join(tempDir, "set-error-handler.js")
+	tamperedContent := []byte("window.onerror=function(t,a){void 0}; console.log('error handler');")
+	if err := os.WriteFile(tamperedFile, tamperedContent, 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(tamperedFile+".ext", []byte("{}"), 0644)
+
+	isQuarantined := mgr.CheckAndQuarantineTamperedJS(tamperedFile)
+	if !isQuarantined {
+		t.Fatal("Must quarantine tampered set-error-handler.js")
+	}
+
+	matches, _ := filepath.Glob(filepath.Join(tempDir, "set-error-handler.js.quarantine.*"))
+	if len(matches) != 1 {
+		t.Fatalf("Must find exactly one .quarantine backup file, found %d", len(matches))
+	}
+	if _, err := os.Stat(tamperedFile); !os.IsNotExist(err) {
+		t.Fatal("Original tampered file must be renamed out of place")
+	}
+
+	// 2. Verify negative case: legitimate modern minified JS using `void 0` is NOT quarantined
+	legitFile := filepath.Join(tempDir, "legit-set-error-handler.js")
+	legitContent := []byte("if(foo === void 0) { console.error('not set'); } window.onerror=function(e){ alert(e); window.location.reload(); }")
+	_ = os.WriteFile(legitFile, legitContent, 0644)
+
+	if mgr.CheckAndQuarantineTamperedJS(legitFile) {
+		t.Fatal("Must NOT quarantine legitimate JS using void 0")
+	}
+
+	// 3. Verify negative case: original official script with alert/reload is NOT quarantined
+	origContent := []byte("window.onerror=function(t,a){ t && alert(t); a && window.location.reload(); };")
+	origFile := filepath.Join(tempDir, "official-set-error-handler.js")
+	_ = os.WriteFile(origFile, origContent, 0644)
+
+	if mgr.CheckAndQuarantineTamperedJS(origFile) {
+		t.Fatal("Must NOT quarantine original official script")
+	}
+
+	// 4. Verify negative case: official error reporter containing rest/error/js must never
+	// be quarantined, even when minified code contains a hollow function body.
+	officialErrContent := []byte(`Game.reportError=function(){};var u="rest/error/js";window.onerror=function(e){void 0};`)
+	officialErrFile := filepath.Join(tempDir, "official-error-reporter-set-error-handler.js")
+	_ = os.WriteFile(officialErrFile, officialErrContent, 0644)
+
+	if mgr.CheckAndQuarantineTamperedJS(officialErrFile) {
+		t.Fatal("Must NOT quarantine official error reporter containing rest/error/js")
+	}
+}
+
+func TestHasCacheAndAutoRepair(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_hascache_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+
+	// HasCache returns false for non-existent
+	if mgr.HasCache("assets/test/missing.png") {
+		t.Error("expected false for missing asset")
+	}
+
+	// Save valid asset
+	mgr.Save("assets/test/sample.png", map[string]string{
+		"content-type": "image/png",
+	}, []byte("\x89PNG\r\n\x1a\nheader"))
+
+	if !mgr.HasCache("assets/test/sample.png") {
+		t.Error("expected true for cached asset")
+	}
+
+	// Corrupt content on disk is deleted on Get()
+	corruptDisk := filepath.Join(tempDir, "assets", "test", "bad.png")
+	_ = os.MkdirAll(filepath.Dir(corruptDisk), 0755)
+	_ = os.WriteFile(corruptDisk, []byte("not_png_bytes"), 0644)
+	_ = os.WriteFile(corruptDisk+".ext", []byte("{}"), 0644)
+
+	mgr.ClearRAM()
+	item, _ := mgr.Get("assets/test/bad.png")
+	if item != nil {
+		t.Error("corrupt content should return nil")
+	}
+	if _, err := os.Stat(corruptDisk); !os.IsNotExist(err) {
+		t.Error("corrupt file should be unlinked on Get auto-repair")
+	}
+}
+
+func TestAsyncCacheSave(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_async_cache_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	validPng := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	item, ok := mgr.SaveRAM("assets/test/async_hero.png", map[string]string{
+		"content-type": "image/png",
+		"etag":         "\"async-etag-1\"",
+	}, validPng)
+	if !ok || item == nil {
+		t.Fatal("SaveRAM returned failure")
+	}
+
+	// Immediate RAM hit
+	ramItem, src := mgr.Get("assets/test/async_hero.png")
+	if ramItem == nil || src != "RAM" {
+		t.Fatalf("expected immediate RAM hit, got %v, src %s", ramItem, src)
+	}
+
+	// Wait for background persistWorker to flush to disk
+	diskFile := filepath.Join(tempDir, "assets", "test", "async_hero.png")
+	extFile := diskFile + ".ext"
+
+	persisted := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(10 * time.Millisecond)
+		if fi, err := os.Stat(diskFile); err == nil && fi.Size() > 0 {
+			if fe, err2 := os.Stat(extFile); err2 == nil && fe.Size() > 0 {
+				persisted = true
+				break
+			}
+		}
+	}
+	if !persisted {
+		t.Fatal("expected background worker to persist file and .ext to disk within 500ms")
+	}
+
+	// Verify disk load after RAM cleared
+	mgr.ClearRAM()
+	diskItem, srcDisk := mgr.Get("assets/test/async_hero.png")
+	if diskItem == nil || srcDisk != "DISK" {
+		t.Fatalf("expected DISK hit after clearing RAM, got %v, src %s", diskItem, srcDisk)
+	}
+}
+
+func TestHostNamespaceIsolation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_ns_cache_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	gbfData := []byte("\x89PNG\r\n\x1a\ngbf_official_data")
+	otherData := []byte("\x89PNG\r\n\x1a\nother_host_data")
+
+	// Save to gbf namespace (mirrors a, a1..a5)
+	mgr.SaveWithNamespace("gbf", "assets/common/img.png", map[string]string{"content-type": "image/png"}, gbfData)
+
+	// Save to isolated custom host
+	savedOther := mgr.SaveWithNamespace("other.example.com", "assets/common/img.png", map[string]string{"content-type": "image/png"}, otherData)
+	if !savedOther {
+		t.Fatalf("SaveWithNamespace failed for other.example.com")
+	}
+
+	// Verify isolation in GetWithNamespace
+	itemGBF, _ := mgr.GetWithNamespace("gbf", "assets/common/img.png")
+	if itemGBF == nil || string(itemGBF.Data) != string(gbfData) {
+		t.Errorf("expected GBF data, got %v", itemGBF)
+	}
+
+	itemOther, _ := mgr.GetWithNamespace("other.example.com", "assets/common/img.png")
+	if itemOther == nil || string(itemOther.Data) != string(otherData) {
+		t.Errorf("expected Other data, got %v", itemOther)
+	}
+
+	// Verify disk paths: GBF in base root, other in hosts/other.example.com/
+	gbfDisk := filepath.Join(tempDir, "assets", "common", "img.png")
+	otherDisk := filepath.Join(tempDir, "hosts", "other.example.com", "assets", "common", "img.png")
+
+	if _, err := os.Stat(gbfDisk); err != nil {
+		t.Errorf("GBF file must be in root cache dir: %v", err)
+	}
+	if _, err := os.Stat(otherDisk); err != nil {
+		t.Errorf("Other file must be in hosts/ subdir: %v", err)
+	}
+}
+
+func TestAsyncDrainOnClose(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_drain_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+
+	pngData := []byte("\x89PNG\r\n\x1a\ndrain_test_data")
+	mgr.SaveRAMWithNamespace("gbf", "assets/drain.png", map[string]string{"content-type": "image/png"}, pngData)
+
+	// Close immediately: Close() must wait for background persistQueue to drain
+	mgr.Close()
+
+	diskFile := filepath.Join(tempDir, "assets", "drain.png")
+	data, err := os.ReadFile(diskFile)
+	if err != nil {
+		t.Fatalf("file must be written to disk before Close() returns: %v", err)
+	}
+	if string(data) != string(pngData) {
+		t.Fatalf("expected %q, got %q", string(pngData), string(data))
+	}
+}
+
+func TestWarmup(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	pngData := []byte("\x89PNG\r\n\x1a\nwarmup_test")
+	// Save 5 files to disk
+	for i := 1; i <= 5; i++ {
+		path := fmt.Sprintf("assets/item%d.png", i)
+		mgr.Save(path, map[string]string{"content-type": "image/png"}, pngData)
+	}
+
+	// Also save a file under hosts/
+	mgr.SaveWithNamespace("example.com", "assets/host_item.png", map[string]string{"content-type": "image/png"}, pngData)
+
+	// Create a quarantined file on disk: Warmup must skip this!
+	quarantinedPath := filepath.Join(tempDir, "assets", "bad.js.quarantine.12345")
+	if err := os.WriteFile(quarantinedPath, []byte("tampered content"), 0644); err != nil {
+		t.Fatalf("failed to create quarantined file: %v", err)
+	}
+
+	// Clear RAM cache so it's empty
+	mgr.ClearRAM()
+	items, _ := mgr.Stats()
+	if items != 0 {
+		t.Fatalf("expected 0 items in RAM after ClearRAM, got %d", items)
+	}
+
+	// Warmup max 3 items
+	loaded := mgr.Warmup(3)
+	if loaded != 3 {
+		t.Fatalf("expected 3 items loaded during Warmup(3), got %d", loaded)
+	}
+
+	items, _ = mgr.Stats()
+	if items != 3 {
+		t.Fatalf("expected 3 items in RAM cache after Warmup(3), got %d", items)
+	}
+
+	// Warmup all items: must load exactly 6 valid items (5 gbf + 1 host) and NOT the quarantined file
+	loadedAll := mgr.Warmup(100)
+	if loadedAll != 6 {
+		t.Fatalf("expected exactly 6 items loaded during Warmup(100), got %d", loadedAll)
+	}
+}
+
+func TestPruneStaleVersionsHosts(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	pngData := []byte("\x89PNG\r\n\x1a\nprune_test")
+
+	// Create 5 versions in base assets
+	for v := 101; v <= 105; v++ {
+		p := fmt.Sprintf("assets/%d/img/sp/img.png", v)
+		mgr.Save(p, map[string]string{"content-type": "image/png"}, pngData)
+	}
+
+	// Create 5 versions in hosts/prd-game-a.akamaized.net/assets
+	for v := 201; v <= 205; v++ {
+		p := fmt.Sprintf("assets/%d/img/sp/img.png", v)
+		mgr.SaveWithNamespace("prd-game-a.akamaized.net", p, map[string]string{"content-type": "image/png"}, pngData)
+	}
+
+	// Prune keeping 2 versions
+	deletedDirs, deletedFiles, _ := mgr.PruneStaleVersions(2)
+	// Base should prune 3 versions (101, 102, 103), hosts should prune 3 versions (201, 202, 203)
+	if deletedDirs != 6 {
+		t.Errorf("expected 6 deleted dirs (3 in base + 3 in hosts), got %d", deletedDirs)
+	}
+	// Each version contains 1 asset file + 1 .ext metadata file = 2 files per version * 6 versions = 12 files
+	if deletedFiles != 12 {
+		t.Errorf("expected 12 deleted files (6 asset + 6 .ext files), got %d", deletedFiles)
+	}
+
+	// Verify latest versions still exist: 104, 105 in base, 204, 205 in hosts
+	if _, err := os.Stat(filepath.Join(tempDir, "assets", "105", "img", "sp", "img.png")); err != nil {
+		t.Error("expected version 105 to be kept in base")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "hosts", "prd-game-a.akamaized.net", "assets", "205", "img", "sp", "img.png")); err != nil {
+		t.Error("expected version 205 to be kept in hosts")
+	}
+	// Verify stale versions deleted
+	if _, err := os.Stat(filepath.Join(tempDir, "assets", "101", "img", "sp", "img.png")); !os.IsNotExist(err) {
+		t.Error("expected version 101 to be deleted from base")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "hosts", "prd-game-a.akamaized.net", "assets", "201", "img", "sp", "img.png")); !os.IsNotExist(err) {
+		t.Error("expected version 201 to be deleted from hosts")
+	}
+}
+
+func TestAuditAndSlimProgress(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+	goodPng := []byte("\x89PNG\r\n\x1a\nprogress_test")
+	if !mgr.Save("assets/img/sp/ui/good.png", map[string]string{"content-type": "image/png"}, goodPng) {
+		t.Fatal("save good asset failed")
+	}
+	zeroPath := filepath.Join(tempDir, "assets", "img", "sp", "ui", "zero.png")
+	if err := os.WriteFile(zeroPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	corruptRel := "assets/img/sp/ui/corrupt.png"
+	if !mgr.Save(corruptRel, map[string]string{"content-type": "image/png"}, goodPng) {
+		t.Fatal("save corrupt fixture failed")
+	}
+	corruptPath := filepath.Join(tempDir, filepath.FromSlash(corruptRel))
+	originalInfo, err := os.Stat(corruptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(corruptPath, bytes.Repeat([]byte("x"), len(goodPng)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(corruptPath, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	var auditCallbacks []AuditProgress
+	res := mgr.AuditAndRepairWithProgress(func(p AuditProgress) { auditCallbacks = append(auditCallbacks, p) }, nil)
+	if res["ok"] != true || res["corrupted"].(int) != 1 {
+		t.Errorf("expected one confirmed corrupt file to be repaired, got %v", res)
+	}
+	if _, err := os.Stat(zeroPath); err != nil {
+		t.Errorf("unconfirmed zero-byte file must be preserved: %v", err)
+	}
+	if len(auditCallbacks) == 0 || !auditCallbacks[len(auditCallbacks)-1].Done {
+		t.Error("expected final audit callback with Done=true")
+	}
+	cancelCh := make(chan struct{})
+	close(cancelCh)
+	if resCancel := mgr.AuditAndRepairWithProgress(nil, cancelCh); resCancel == nil {
+		t.Fatal("expected non-nil result on cancelled audit")
+	}
+	for v := 1; v <= 5; v++ {
+		if !mgr.Save(fmt.Sprintf("assets/%d/js/test.js", v), map[string]string{"content-type": "application/javascript"}, []byte("console.log('version');")) {
+			t.Fatalf("save version %d failed", v)
+		}
+	}
+	var slimCallbacks []SlimProgress
+	delDirs, delFiles, _ := mgr.PruneStaleVersionsWithProgress(2, func(p SlimProgress) { slimCallbacks = append(slimCallbacks, p) }, nil)
+	if delDirs != 3 {
+		t.Errorf("expected 3 deleted dirs, got %d", delDirs)
+	}
+	if delFiles != 6 {
+		t.Errorf("expected 6 deleted files, got %d", delFiles)
+	}
+	if len(slimCallbacks) == 0 || !slimCallbacks[len(slimCallbacks)-1].Done {
+		t.Error("expected final slim callback with Done=true")
+	}
+}
+
+func TestResolveDiskFileOwner(t *testing.T) {
+	tempBase := t.TempDir()
+
+	// 1. Static path test cases (no .ext file on disk)
+	cases := []struct {
+		name, path, expectedNS, expectedKey, expectedRAM string
+		expectedOK                                       bool
+	}{
+		{name: "standard GBF asset", path: filepath.Join(tempBase, "assets", "sound.mp3"), expectedNS: "gbf", expectedKey: "assets/sound.mp3", expectedRAM: "assets/sound.mp3", expectedOK: true},
+		{name: "external host asset", path: filepath.Join(tempBase, "hosts", "prd-game-a.example.com", "assets", "img.png"), expectedNS: "prd-game-a.example.com", expectedKey: "assets/img.png", expectedRAM: "prd-game-a.example.com\x00assets/img.png", expectedOK: true},
+		{name: "incomplete host path rejected", path: filepath.Join(tempBase, "hosts", "short"), expectedOK: false},
+		{name: "path traversal outside base rejected", path: filepath.Join(tempBase, "..", "outside.png"), expectedOK: false},
+		{name: "deep relative traversal rejected", path: filepath.Join(tempBase, "assets", "..", "..", "outside.png"), expectedOK: false},
+		{name: "namespace with port sanitized", path: filepath.Join(tempBase, "hosts", "myhost.com_8080", "assets", "data.bin"), expectedNS: "myhost.com_8080", expectedKey: "assets/data.bin", expectedRAM: "myhost.com_8080\x00assets/data.bin", expectedOK: true},
+		{name: "base path itself rejected", path: tempBase, expectedOK: false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ns, cleanKey, ramKey, ok := resolveDiskFileOwner(tempBase, tc.path)
+			if ok != tc.expectedOK {
+				t.Fatalf("path %q: expected ok=%v, got %v", tc.path, tc.expectedOK, ok)
+			}
+			if !tc.expectedOK {
+				return
+			}
+			if ns != tc.expectedNS || cleanKey != tc.expectedKey || ramKey != tc.expectedRAM {
+				t.Errorf("path %q: got (%q, %q, %q), want (%q, %q, %q)", tc.path, ns, cleanKey, ramKey, tc.expectedNS, tc.expectedKey, tc.expectedRAM)
+			}
+		})
+	}
+
+	writeExtAsset := func(subDir, file, extData string) string {
+		p := filepath.Join(tempBase, filepath.FromSlash(subDir), file)
+		_ = os.MkdirAll(filepath.Dir(p), 0755)
+		_ = os.WriteFile(p, []byte("data"), 0644)
+		_ = os.WriteFile(p+".ext", []byte(extData), 0644)
+		return p
+	}
+
+	// 2. Metadata (.ext file) behavior
+	t.Run("ext file overrides namespace to gbf", func(t *testing.T) {
+		assetPath := writeExtAsset("hosts/prd-game-a.example.com/assets", "gbf_override.png", `{"v":1,"ns":"gbf"}`)
+		ns, cleanKey, ramKey, ok := resolveDiskFileOwner(tempBase, assetPath)
+		if !ok || ns != "gbf" {
+			t.Fatalf("expected ok=true ns='gbf', got ok=%v ns=%q", ok, ns)
+		}
+		expectedKey := "hosts/prd-game-a.example.com/assets/gbf_override.png"
+		if cleanKey != expectedKey || ramKey != expectedKey {
+			t.Errorf("expected %q, got cleanKey=%q ramKey=%q", expectedKey, cleanKey, ramKey)
+		}
+	})
+
+	t.Run("ext file overrides namespace to custom host", func(t *testing.T) {
+		assetPath := writeExtAsset("hosts/alias.example.com/assets", "custom_override.png", `{"v":1,"ns":"canonical.example.com"}`)
+		ns, cleanKey, ramKey, ok := resolveDiskFileOwner(tempBase, assetPath)
+		if !ok || ns != "canonical.example.com" {
+			t.Fatalf("expected ok=true, got ok=%v ns=%q", ok, ns)
+		}
+		if cleanKey != "assets/custom_override.png" || ramKey != "canonical.example.com\x00assets/custom_override.png" {
+			t.Errorf("unexpected cleanKey=%q ramKey=%q", cleanKey, ramKey)
+		}
+	})
+
+	t.Run("ext file with forbidden hosts namespace rejected", func(t *testing.T) {
+		assetPath := writeExtAsset("hosts/alias.example.com/assets", "forbidden_ns.png", `{"v":1,"ns":"hosts"}`)
+		if _, _, _, ok := resolveDiskFileOwner(tempBase, assetPath); ok {
+			t.Errorf("expected ok=false for ext file with ns='hosts', got true")
+		}
+	})
+
+	t.Run("ext file corrupted falls back to directory namespace", func(t *testing.T) {
+		assetPath := writeExtAsset("hosts/prd-game-a.example.com/assets", "corrupted.png", `invalid json`)
+		ns, cleanKey, ramKey, ok := resolveDiskFileOwner(tempBase, assetPath)
+		if !ok || ns != "prd-game-a.example.com" || cleanKey != "assets/corrupted.png" || ramKey != "prd-game-a.example.com\x00assets/corrupted.png" {
+			t.Fatalf("unexpected result: ok=%v ns=%q cleanKey=%q ramKey=%q", ok, ns, cleanKey, ramKey)
+		}
+	})
+
+	t.Run("windows drive case insensitive matching", func(t *testing.T) {
+		if len(tempBase) < 2 || tempBase[1] != ':' {
+			t.Skip("skipping Windows drive test on non-drive base")
+		}
+		var invertedDrive string
+		if tempBase[0] >= 'A' && tempBase[0] <= 'Z' {
+			invertedDrive = strings.ToLower(string(tempBase[0])) + tempBase[1:]
+		} else {
+			invertedDrive = strings.ToUpper(string(tempBase[0])) + tempBase[1:]
+		}
+		testPath := filepath.Join(invertedDrive, "assets", "drive_case.mp3")
+		ns, cleanKey, ramKey, ok := resolveDiskFileOwner(tempBase, testPath)
+		if !ok {
+			t.Fatalf("expected ok=true for drive case difference, got false")
+		}
+		if ns != "gbf" || cleanKey != "assets/drive_case.mp3" || ramKey != "assets/drive_case.mp3" {
+			t.Errorf("unexpected result for drive case: ns=%q, cleanKey=%q, ramKey=%q", ns, cleanKey, ramKey)
+		}
+	})
+}
+
+func TestAuditAndRepairRAMCachePurge(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+	badContent := []byte("<html>502 Bad Gateway</html>")
+	goodPNG := append([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"), bytes.Repeat([]byte("P"), len(badContent)-16)...)
+	corruptSavedAsset := func(ns, key, ramKey string) string {
+		t.Helper()
+		if !mgr.SaveWithNamespace(ns, key, map[string]string{"content-type": "image/png"}, goodPNG) {
+			t.Fatalf("save %s/%s failed", ns, key)
+		}
+		path, ok := mgr.resolvePathWithNamespace(ns, key)
+		if !ok {
+			t.Fatalf("resolve %s/%s failed", ns, key)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, badContent, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+		mgr.ramCache.Set(ramKey, &CacheItem{Data: badContent, ContentType: "image/png"})
+		return path
+	}
+	gbfKey := "assets/img/sp/ui/bad_gbf.png"
+	gbfRAMKey := makeRAMKey("gbf", gbfKey)
+	gbfFile := corruptSavedAsset("gbf", gbfKey, gbfRAMKey)
+	hostNS := "prd-game-a.akamaized.net"
+	hostKey := "assets/img/sp/ui/bad_host.png"
+	hostRAMKey := makeRAMKey(hostNS, hostKey)
+	hostFile := corruptSavedAsset(hostNS, hostKey, hostRAMKey)
+	res := mgr.AuditAndRepair()
+	if res["ok"] != true || res["corrupted"].(int) != 2 {
+		t.Errorf("expected two confirmed corrupt assets to be repaired, got %v", res)
+	}
+	for key, path := range map[string]string{gbfRAMKey: gbfFile, hostRAMKey: hostFile} {
+		if mgr.ramCache.Contains(key) {
+			t.Errorf("%s should have been removed from RAM cache", key)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s should have been removed, stat err=%v", path, err)
+		}
+	}
+}
+
+func TestAuditAndRepairSkipsQuarantinedFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	// 1. Create a legitimate cache-owned file with verified metadata.
+	goodContent := append([]byte("\x89PNG\r\n\x1a\n"), []byte("legitimate image data")...)
+	goodRel := "assets/img/sp/ui/good.png"
+	if !mgr.Save(goodRel, map[string]string{"content-type": "image/png"}, goodContent) {
+		t.Fatal("save legitimate cache fixture failed")
+	}
+
+	// 2. Create a quarantined backup file on disk
+	quarantineFile := filepath.Join(tempDir, "assets", "bad.js.quarantine.1234567")
+	_ = os.WriteFile(quarantineFile, []byte("tampered content"), 0644)
+
+	res := mgr.AuditAndRepair()
+	scanned := res["scanned"].(int)
+	healthy := res["healthy"].(int)
+	corrupted := res["corrupted"].(int)
+
+	// Quarantined file must be ignored: exactly 1 scanned (the good file)
+	if scanned != 1 {
+		t.Errorf("expected scanned=1 (skipping .quarantine), got %d", scanned)
+	}
+	if healthy != 1 {
+		t.Errorf("expected healthy=1, got %d", healthy)
+	}
+	if corrupted != 0 {
+		t.Errorf("expected corrupted=0, got %d", corrupted)
+	}
+}
+
+func TestGetFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	pngData := []byte("\x89PNG\r\n\x1a\ntest_fallback_data")
+
+	// 1. Direct hit
+	mgr.SaveRAMWithNamespace("gbf", "assets/direct.png", map[string]string{"content-type": "image/png"}, pngData)
+	item, src := mgr.GetFallback("/assets/direct.png")
+	if item == nil || src != "RAM" {
+		t.Fatalf("expected direct RAM hit, got item=%v, src=%s", item, src)
+	}
+
+	// 2. Versioned fallback using fallbackTimestampRe
+	// Save asset with multiple older versions to disk: 10001, 10005, 10003
+	mgr.Save("assets/10001/sound/bgm.mp3", map[string]string{"content-type": "audio/mpeg"}, []byte("v10001"))
+	mgr.Save("assets/10005/sound/bgm.mp3", map[string]string{"content-type": "audio/mpeg"}, []byte("v10005"))
+	mgr.Save("assets/10003/sound/bgm.mp3", map[string]string{"content-type": "audio/mpeg"}, []byte("v10003"))
+
+	// Request asset with newer version 10006 that does not exist in cache; must pick highest (10005)
+	itemVer, srcVer := mgr.GetFallback("/assets/10006/sound/bgm.mp3")
+	if itemVer == nil {
+		t.Fatalf("expected version fallback hit for /assets/10006/sound/bgm.mp3, got nil")
+	}
+	if srcVer != "STALE-VERSION-10005" {
+		t.Errorf("expected src STALE-VERSION-10005, got %s", srcVer)
+	}
+	if string(itemVer.Data) != "v10005" {
+		t.Errorf("expected data v10005, got %s", string(itemVer.Data))
+	}
+
+	// Also test assets_en versioned fallback
+	mgr.Save("assets_en/20001/sound/se.mp3", map[string]string{"content-type": "audio/mpeg"}, []byte("v20001_en"))
+	itemEn, srcEn := mgr.GetFallback("/assets_en/20002/sound/se.mp3")
+	if itemEn == nil || srcEn != "STALE-VERSION-20001" {
+		t.Errorf("expected assets_en version fallback STALE-VERSION-20001, got item=%v, src=%s", itemEn, srcEn)
+	}
+
+	// 3. Cross-lang fallback
+	mgr.SaveRAMWithNamespace("gbf", "assets/banner.png", map[string]string{"content-type": "image/png"}, pngData)
+	itemLang, srcLang := mgr.GetFallback("/assets_en/banner.png")
+	if itemLang == nil {
+		t.Fatalf("expected cross-lang fallback hit for /assets_en/banner.png, got nil")
+	}
+	if srcLang != "CROSS-LANG-JP" {
+		t.Errorf("expected src CROSS-LANG-JP, got %s", srcLang)
+	}
+
+	// 4. Missing path returns nil
+	itemMiss, srcMiss := mgr.GetFallback("/unknown/path/asset.png")
+	if itemMiss != nil || srcMiss != "" {
+		t.Errorf("expected nil for unknown path, got item=%v, src=%s", itemMiss, srcMiss)
+	}
+}
+
+func TestCacheManagerExtVersionGuard(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+
+	pngData := append([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, bytes.Repeat([]byte{0}, 20)...)
+	testFile := filepath.Join(tempDir, "assets", "test.png")
+	testExt := testFile + ".ext"
+	_ = os.MkdirAll(filepath.Dir(testFile), 0755)
+	_ = os.WriteFile(testFile, pngData, 0644)
+
+	// Case 1: valid v: 1 metadata
+	metaV1 := map[string]interface{}{
+		"v":    1,
+		"ct":   "image/png",
+		"ETag": "\"test-etag-v1\"",
+	}
+	v1Bytes, _ := json.Marshal(metaV1)
+	_ = os.WriteFile(testExt, v1Bytes, 0644)
+	mgr.ClearRAM()
+
+	item1, src1 := mgr.Get("assets/test.png")
+	if item1 == nil || src1 != "DISK" {
+		t.Fatalf("expected DISK hit for valid v: 1 metadata, got item=%v, src=%s", item1, src1)
+	}
+	if item1.ContentType != "image/png" {
+		t.Errorf("expected Content-Type image/png, got %s", item1.ContentType)
+	}
+	if item1.ETag != "\"test-etag-v1\"" {
+		t.Errorf("expected ETag \"test-etag-v1\", got %s", item1.ETag)
+	}
+
+	// Case 2: outdated or unsupported v != 1 (e.g. v: 99 or missing v)
+	metaBadV := map[string]interface{}{
+		"v":    99,
+		"ct":   "custom/unknown",
+		"ETag": "\"bad-etag-v99\"",
+	}
+	badVBytes, _ := json.Marshal(metaBadV)
+	_ = os.WriteFile(testExt, badVBytes, 0644)
+	mgr.ClearRAM()
+
+	item2, src2 := mgr.Get("assets/test.png")
+	if item2 == nil || src2 != "DISK" {
+		t.Fatalf("expected DISK hit with fallback for v: 99, got item=%v, src=%s", item2, src2)
+	}
+	// Must fallback safely to extension-based MIME (image/png) instead of custom/unknown
+	if item2.ContentType != "image/png" {
+		t.Errorf("expected fallback Content-Type image/png, got %s", item2.ContentType)
+	}
+	// Must fallback to dynamically generated etag instead of bad-etag
+	if item2.ETag == "\"bad-etag-v99\"" {
+		t.Errorf("metadata with v: 99 must be ignored, but got bad-etag-v99")
+	}
+
+	// Case 3: corrupt non-object JSON or malformed content
+	_ = os.WriteFile(testExt, []byte("[1, 2, 3]"), 0644)
+	mgr.ClearRAM()
+
+	item3, src3 := mgr.Get("assets/test.png")
+	if item3 == nil || src3 != "DISK" {
+		t.Fatalf("expected DISK hit with fallback for corrupt JSON, got item=%v, src=%s", item3, src3)
+	}
+	if item3.ContentType != "image/png" {
+		t.Errorf("expected fallback Content-Type image/png, got %s", item3.ContentType)
+	}
+	if item3.ETag == "" {
+		t.Errorf("expected non-empty fallback ETag, got empty")
+	}
+}
+
+func TestConcurrentSaveSameFileNoCollision(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	// 20 goroutines simultaneously write to the exact same file path
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			data := []byte(fmt.Sprintf("\x89PNG\r\n\x1a\nconcurrent_data_worker_%d", id))
+			mgr.Save("assets/shared_concurrent.png", map[string]string{"content-type": "image/png"}, data)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// File must exist on disk and be readable without corruption
+	filePath := filepath.Join(tempDir, "assets", "shared_concurrent.png")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("expected file to exist after concurrent writes: %v", err)
+	}
+	if !strings.HasPrefix(string(data), "\x89PNG\r\n\x1a\nconcurrent_data_worker_") {
+		t.Fatalf("unexpected content in concurrent file: %q", string(data))
+	}
+}
+
+func TestMultiTaskDrainOnClose(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+
+	const taskCount = 30
+	for i := 0; i < taskCount; i++ {
+		path := fmt.Sprintf("assets/drain_multi_%d.png", i)
+		data := []byte(fmt.Sprintf("\x89PNG\r\n\x1a\ndrain_data_%d", i))
+		mgr.SaveRAMWithNamespace("gbf", path, map[string]string{"content-type": "image/png"}, data)
+	}
+
+	// Close immediately: all 30 tasks must be drained and written to disk
+	mgr.Close()
+
+	for i := 0; i < taskCount; i++ {
+		filePath := filepath.Join(tempDir, "assets", fmt.Sprintf("drain_multi_%d.png", i))
+		if _, err := os.Stat(filePath); err != nil {
+			t.Fatalf("task %d was not drained to disk before Close() returned: %v", i, err)
+		}
+	}
+}
+
+func TestLoadAndValidateDiskItem(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gbf_validate_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	// 1. Valid PNG with .ext metadata
+	pngDir := filepath.Join(tempDir, "assets", "img")
+	_ = os.MkdirAll(pngDir, 0755)
+	pngFile := filepath.Join(pngDir, "test.png")
+	pngData := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRheader")
+	if err := os.WriteFile(pngFile, pngData, 0644); err != nil {
+		t.Fatalf("failed to write test png: %v", err)
+	}
+	extData := `{"ContentType":"image/png","ETag":"\"custom-etag\"","LastModified":"Sun, 01 Jan 2023 00:00:00 GMT","v":1}`
+	if err := os.WriteFile(pngFile+".ext", []byte(extData), 0644); err != nil {
+		t.Fatalf("failed to write test .ext: %v", err)
+	}
+
+	item, err := mgr.loadAndValidateDiskItem("gbf", "assets/img/test.png", pngFile)
+	if err != nil {
+		t.Fatalf("expected valid load, got error: %v", err)
+	}
+	if item.ContentType != "image/png" || item.ETag != "\"custom-etag\"" {
+		t.Errorf("unexpected metadata: %+v", item)
+	}
+	if string(item.Data) != string(pngData) {
+		t.Errorf("data mismatch")
+	}
+
+	// 2. Empty file should error
+	emptyFile := filepath.Join(pngDir, "empty.png")
+	_ = os.WriteFile(emptyFile, []byte{}, 0644)
+	if _, err := mgr.loadAndValidateDiskItem("gbf", "assets/img/empty.png", emptyFile); err == nil {
+		t.Errorf("expected error for empty file, got nil")
+	}
+
+	// 3. Corrupt file (HTML error page saved with .js) should error and auto-repair delete
+	corruptJs := filepath.Join(pngDir, "bad.js")
+	_ = os.WriteFile(corruptJs, []byte("<html><body>502 Bad Gateway</body></html>"), 0644)
+	_ = os.WriteFile(corruptJs+".ext", []byte(`{"ContentType":"text/html","v":1}`), 0644)
+	if _, err := mgr.loadAndValidateDiskItem("gbf", "assets/img/bad.js", corruptJs); err == nil {
+		t.Errorf("expected error for invalid cache content, got nil")
+	}
+	// Verify corrupt file was deleted by auto-repair
+	if _, err := os.Stat(corruptJs); !os.IsNotExist(err) {
+		t.Errorf("expected corrupt file to be removed by autoRepair, but it still exists")
+	}
+}
+
+func TestDiskTempFileAndCommit(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 16)
+	defer mgr.Close()
+
+	urlPath := "/assets/large/movie.mp4"
+	f, tmpPath, gen, err := mgr.CreateDiskTempFile("gbf", urlPath)
+	if err != nil {
+		t.Fatalf("CreateDiskTempFile failed: %v", err)
+	}
+
+	payload := []byte("large_binary_movie_stream_content_1234567890")
+	if _, err := f.Write(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	_ = f.Close()
+
+	headers := map[string]string{
+		"content-type": "video/mp4",
+		"etag":         `"movie-etag"`,
+	}
+	item, ok := mgr.CommitDiskTempFile("gbf", urlPath, headers, tmpPath, int64(len(payload)), gen)
+	if !ok || item == nil {
+		t.Fatalf("CommitDiskTempFile failed")
+	}
+
+	if item.Size != int64(len(payload)) || item.ContentType != "video/mp4" || item.ETag != `"movie-etag"` {
+		t.Errorf("unexpected committed item metadata: %+v", item)
+	}
+
+	// Verify temp file no longer exists
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Errorf("expected temp file to be moved, but still exists: %s", tmpPath)
+	}
+
+	// Verify file is readable via ReadDiskItemData (both direct and assets/ fallback)
+	data, err := mgr.ReadDiskItemData("gbf", urlPath)
+	if err != nil {
+		t.Fatalf("ReadDiskItemData failed: %v", err)
+	}
+	if string(data) != string(payload) {
+		t.Errorf("payload mismatch: got %q, want %q", string(data), string(payload))
+	}
+
+	// Verify fallback when path lacks "assets/" prefix
+	dataAlt, errAlt := mgr.ReadDiskItemData("gbf", "/large/movie.mp4")
+	if errAlt != nil {
+		t.Fatalf("ReadDiskItemData fallback failed: %v", errAlt)
+	}
+	if string(dataAlt) != string(payload) {
+		t.Errorf("fallback payload mismatch: got %q, want %q", string(dataAlt), string(payload))
+	}
+
+	// Verify GetWithNamespace hits DISK
+	diskHit, src := mgr.GetWithNamespace("gbf", urlPath)
+	if diskHit == nil || src != "DISK" {
+		t.Fatalf("expected DISK hit, got item=%v, src=%s", diskHit, src)
+	}
+}
+
+func TestMaxRAMItemSize(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewManager(tempDir, 256) // 256 MB
+	defer mgr.Close()
+
+	// 256 MB / 16 shards = 16 MB
+	maxItem := mgr.MaxRAMItemSize()
+	expected := int64(16 * 1024 * 1024)
+	if maxItem != expected {
+		t.Fatalf("expected max RAM item size %d, got %d", expected, maxItem)
+	}
+
+	// When RAM cache disabled
+	mgr.SetRAMEnabled(false)
+	if mgr.MaxRAMItemSize() != 0 {
+		t.Fatalf("expected 0 when RAM disabled, got %d", mgr.MaxRAMItemSize())
+	}
+}
+
+func TestClearAllRefusesProtectedCacheRootBeforeClearingRAM(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("home directory unavailable")
+	}
+	mgr := NewManager(t.TempDir(), 16)
+	defer mgr.Close()
+	mgr.SetCacheBase(filepath.Join(home, "Downloads"))
+	key := "assets/img/sp/ui/keep.png"
+	mgr.ramCache.Set(key, &CacheItem{Key: key, Data: []byte("keep"), Size: 4})
+	deleted, freed, skipped := mgr.ClearAll()
+	if deleted != 0 || freed != 0 || skipped != 0 {
+		t.Fatalf("protected root should reject ClearAll: (%d,%d,%d)", deleted, freed, skipped)
+	}
+	if got, ok := mgr.ramCache.Get(key); !ok || got == nil {
+		t.Fatal("ClearAll must not clear RAM when root is rejected")
+	}
+}
+
+func TestAuditPreservesUnconfirmedAndLegacyFiles(t *testing.T) {
+	base := t.TempDir()
+	_ = EnsureRootMarker(base)
+	writeTestDiskFile(t, base, "assets/personal_data/profile.png", []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRuser"))
+	writeTestDiskFile(t, base, "assets/img/sp/ui/legacy_broken.png", []byte("not-a-png"))
+	mgr := NewManager(base, 16)
+	defer mgr.Close()
+	res := mgr.AuditAndRepair()
+	if res["ok"] != true || res["corrupted"].(int) != 0 || res["unverified_corrupted"].(int) != 0 {
+		t.Fatalf("unverified files must not be auto-deleted, got %+v", res)
+	}
+	assertPathStatus(t, base, []string{"assets/personal_data/profile.png", "assets/img/sp/ui/legacy_broken.png"}, true)
+}

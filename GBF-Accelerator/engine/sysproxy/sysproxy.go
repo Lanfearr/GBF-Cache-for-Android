@@ -1,0 +1,162 @@
+package sysproxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"gbf-proxy/config"
+)
+
+const stateFileName = ".sysproxy_state.json"
+
+type ProxyState struct {
+	OriginalPACURL string `json:"original_pac_url"`
+	ManagedPACURL  string `json:"managed_pac_url"`
+}
+
+func getStateFilePath() string {
+	return filepath.Join(config.GetBaseDir(), stateFileName)
+}
+
+func saveState(orig, managed string) {
+	st := ProxyState{
+		OriginalPACURL: orig,
+		ManagedPACURL:  managed,
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(getStateFilePath(), data, 0644)
+	}
+}
+
+func loadState() ProxyState {
+	var st ProxyState
+	data, err := os.ReadFile(getStateFilePath())
+	if err == nil {
+		_ = json.Unmarshal(data, &st)
+	}
+	return st
+}
+
+func removeStateFile() {
+	_ = os.Remove(getStateFilePath())
+}
+
+var (
+	mu              sync.Mutex
+	isManagingProxy bool
+	originalPACURL  string
+	managedPACURL   string
+)
+
+// GetCurrentPACURL retrieves the current system AutoConfigURL if configured.
+func GetCurrentPACURL() string {
+	return getCurrentPACURL()
+}
+
+// IsPACProxyEnabled checks whether the system proxy PAC currently points to our local accelerator.
+func IsPACProxyEnabled(port int) bool {
+	url := strings.ToLower(strings.TrimSpace(GetCurrentPACURL()))
+	if url == "" {
+		return false
+	}
+	if !strings.Contains(url, "/proxy.pac") {
+		return false
+	}
+	if !strings.Contains(url, "127.0.0.1") && !strings.Contains(url, "localhost") {
+		return false
+	}
+	if port > 0 {
+		return strings.Contains(url, fmt.Sprintf(":%d/proxy.pac", port))
+	}
+	return true
+}
+
+// CheckProxyConflict checks if an external system proxy or external PAC script is configured.
+// Returns a descriptive conflict message if detected, or empty string if clear.
+func CheckProxyConflict(port int) string {
+	mu.Lock()
+	defer mu.Unlock()
+	return checkProxyConflict(port)
+}
+
+// EnablePACProxy sets the system PAC proxy pointing to local accelerator.
+func EnablePACProxy(pacURL string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if pacURL == "" {
+		pacURL = "http://127.0.0.1:8124/proxy.pac"
+	}
+	if originalPACURL == "" {
+		saved := loadState()
+		if saved.OriginalPACURL != "" {
+			originalPACURL = saved.OriginalPACURL
+		}
+	}
+	err := enablePACProxy(pacURL)
+	if err == nil {
+		isManagingProxy = true
+		managedPACURL = pacURL
+		saveState(originalPACURL, managedPACURL)
+	}
+	return err
+}
+
+// DisablePACProxy restores or disables the system PAC proxy.
+func DisablePACProxy(force bool) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !isManagingProxy {
+		saved := loadState()
+		if saved.ManagedPACURL != "" {
+			isManagingProxy = true
+			managedPACURL = saved.ManagedPACURL
+			if originalPACURL == "" {
+				originalPACURL = saved.OriginalPACURL
+			}
+		}
+	}
+
+	currentPAC := strings.TrimSpace(GetCurrentPACURL())
+	isManaged := isManagingProxy && managedPACURL != "" && strings.EqualFold(currentPAC, managedPACURL)
+
+	// Never overwrite a PAC that was changed by another application/user after
+	// we mounted ours. Only force=true may override an externally changed PAC.
+	if !force {
+		if isManagingProxy && !isManaged {
+			isManagingProxy = false
+			managedPACURL = ""
+			originalPACURL = ""
+			removeStateFile()
+			return nil
+		}
+		if !isManagingProxy {
+			removeStateFile()
+			return nil
+		}
+	}
+
+	err := disablePACProxy(force)
+	if err == nil {
+		isManagingProxy = false
+		managedPACURL = ""
+		originalPACURL = ""
+		removeStateFile()
+	}
+	return err
+}
+
+// CleanupOnExit safely restores system proxy settings on application shutdown.
+func CleanupOnExit() {
+	mu.Lock()
+	managing := isManagingProxy
+	mu.Unlock()
+	if managing || loadState().ManagedPACURL != "" {
+		_ = DisablePACProxy(false)
+	}
+}

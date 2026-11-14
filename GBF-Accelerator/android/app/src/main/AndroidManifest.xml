@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <queries>
+        <package android:name="com.dena.skyleap" />
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".GbfApplication"
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.GBFAccelerator"
+        android:usesCleartextTraffic="true"
+        tools:targetApi="35">
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Started and stopped only through explicit in-app intents (CoreService.start/stop),
+             never resolved from another app. -->
+        <service
+            android:name="com.sagisawa.gbfaccelerator.core.CoreService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+                <action android:name="com.sagisawa.gbfaccelerator.ACTION_START" />
+                <action android:name="com.sagisawa.gbfaccelerator.ACTION_STOP" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="VPN tunnel and local proxy daemon lifecycle management for selected browsers" />
+        </service>
+
+        <!-- Relays the same explicit actions to CoreService from inside the app; no component
+             sends these broadcasts across an app boundary. -->
+        <receiver
+            android:name="com.sagisawa.gbfaccelerator.core.CoreControlReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.sagisawa.gbfaccelerator.ACTION_START" />
+                <action android:name="com.sagisawa.gbfaccelerator.ACTION_STOP" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

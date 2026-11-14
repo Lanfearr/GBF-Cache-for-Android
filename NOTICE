@@ -1,0 +1,52 @@
+GBF Cache
+Copyright (c) 2026
+
+This project combines several open-source components.
+
+---------------------------------------------------------------------------
+GBF-Accelerator
+---------------------------------------------------------------------------
+Source: https://github.com/Sagisawa/GBF-Accelerator
+License: MIT
+
+The Android host application, GBF core integration, cache management UI,
+CA management utilities, and browser launch helpers are derived from or
+built on top of GBF-Accelerator.
+
+---------------------------------------------------------------------------
+mihomo
+---------------------------------------------------------------------------
+Source: https://github.com/MetaCubeX/mihomo
+License: MIT
+
+mihomo is the rule-based tunnel core used for TUN routing, DNS, and
+rule matching.
+
+---------------------------------------------------------------------------
+ClashMetaForAndroid core
+---------------------------------------------------------------------------
+Source: https://github.com/MetaCubeX/ClashMetaForAndroid
+Version: v2.11.37
+License: GPL-3.0
+
+The Android core module (Kotlin/JNI wrapper) and prebuilt native libraries
+libclash.so and libbridge.so are taken from ClashMetaForAndroid. Because
+this project links these GPL-3.0 components, the combined application is
+distributed under GPL-3.0.
+
+If you distribute a binary of this application, you must also make the
+corresponding source code available under GPL-3.0, including the build
+scripts and any modifications.
+
+---------------------------------------------------------------------------
+AndroidX / Kotlin / kotlinx
+---------------------------------------------------------------------------
+AndroidX libraries: Apache License 2.0
+Kotlin and kotlinx libraries: Apache License 2.0
+
+---------------------------------------------------------------------------
+Local CA notice
+---------------------------------------------------------------------------
+GBF Cache generates a local CA certificate for MITM caching of GBF static
+resources. The CA private key stays on the device. Do not share it. Install
+the CA only on devices you trust.

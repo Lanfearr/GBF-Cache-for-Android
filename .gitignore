@@ -1,0 +1,90 @@
+# ============================================================
+# GBF Cache - 根目录 .gitignore
+# GBF-Accelerator/、android/、cmfa-src/ 内已有的 .gitignore 仍生效，
+# 本文件为整个仓库提供统一规则。
+# ============================================================
+
+# ---------- 操作系统 / 编辑器 ----------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+.history/
+
+# ---------- 密钥 / 本地配置（禁止提交） ----------
+local.properties
+*.keystore
+*.jks
+*.p12
+signing.properties
+secrets.properties
+.env
+.env.*
+cmfa-src/**/release.keystore
+
+# ---------- 仓库内已解压的 Gradle 发行版（可重新下载，约 300MB） ----------
+/gradle-8.10.2/
+/gradle-9.7.1/
+
+# ---------- Gradle / Android 构建缓存与产物 ----------
+.gradle/
+build/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+hs_err_pid*
+replay_pid*
+gradle-daemon-jvm.properties
+gradle-app.setting
+.gradletasknamecache
+
+# Android 打包 / 发布产物
+*.apk
+*.aab
+*.ap_
+*.aar
+outputs/
+/dist/
+
+# 从 CMFA release APK 提取的原生库（按 BUILD.md 重新提取，约 60MB）
+cmfa-aar/core/src/main/jniLibs/**/*.so
+
+# ---------- Go 构建产物 ----------
+GBF-Accelerator/bin/
+GBF-Accelerator/release/
+*.exe
+*.test
+*.out
+
+# ---------- Node / 前端 ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vite/
+coverage/
+
+# ---------- 运行时生成文件 ----------
+/GBF-Accelerator/certs/
+/GBF-Accelerator/cache/
+/GBF-Accelerator/config.json
+*.log
+*.tmp
+
+# ---------- Python（上游脚本可能用到） ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/

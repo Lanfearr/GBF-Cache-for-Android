@@ -1,0 +1,382 @@
+package updater
+
+import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func TestIsSafeZipPath(t *testing.T) {
+	allowed := []string{
+		"GBF_Accelerator.exe",
+		"GBF_Accelerator.app/Contents/MacOS/GBF_Accelerator",
+		"GBF_Accelerator.app/Contents/Resources/icon.icns",
+	}
+	for _, name := range allowed {
+		if !isSafeZipPath(name) {
+			t.Errorf("expected safe path: %q", name)
+		}
+	}
+
+	blocked := []string{
+		"../evil.exe",
+		"GBF_Accelerator.app/../../evil",
+		"/absolute/path",
+		"C:/evil.exe",
+	}
+	for _, name := range blocked {
+		if isSafeZipPath(name) {
+			t.Errorf("expected blocked path: %q", name)
+		}
+	}
+}
+
+func TestExtractWindowsExecutable(t *testing.T) {
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	f, err := zw.Create("GBF_Accelerator.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("fake-pe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tempDir := t.TempDir()
+	archive := filepath.Join(tempDir, "release.zip")
+	if err := os.WriteFile(archive, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stage, err := extractWindowsExecutable(archive, tempDir)
+	if err != nil {
+		t.Fatalf("extractWindowsExecutable failed: %v", err)
+	}
+	defer os.Remove(stage)
+
+	got, err := os.ReadFile(stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "fake-pe" {
+		t.Fatalf("unexpected extracted data: %q", string(got))
+	}
+}
+
+func TestVerifyArchiveSHA256(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "archive.zip")
+	data := []byte("update archive")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(data)
+	hash := hex.EncodeToString(h[:])
+
+	if err := verifyArchiveSHA256(path, hash); err != nil {
+		t.Fatalf("expected matching checksum, got %v", err)
+	}
+	if err := verifyArchiveSHA256(path, "0000000000000000000000000000000000000000000000000000000000000000"); err == nil {
+		t.Fatal("expected checksum mismatch")
+	}
+	if err := verifyArchiveSHA256(path, ""); err == nil {
+		t.Fatal("expected empty checksum to be rejected")
+	}
+}
+
+func TestParseApplyArgsAndRestartArgs(t *testing.T) {
+	tempDir := t.TempDir()
+	argsPath := filepath.Join(tempDir, "restart.json")
+	wantArgs := []string{"--minimized", "--proxy-port", "8124", "--custom-flag=value"}
+	data, err := json.Marshal(wantArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(argsPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := parseApplyArgs([]string{
+		"helper.exe",
+		updateApplyFlag,
+		updateArchiveFlag, filepath.Join(tempDir, "update.zip"),
+		updateTargetFlag, filepath.Join(tempDir, "GBF_Accelerator.exe"),
+		updateSHA256Flag, "abcdef",
+		updateVersionFlag, "2.1.0",
+		updateRestartArgsFlag, argsPath,
+	})
+	if err != nil {
+		t.Fatalf("parseApplyArgs failed: %v", err)
+	}
+	if parsed.ArchivePath == "" || parsed.TargetPath == "" || parsed.ExpectedSHA256 != "abcdef" || parsed.Version != "2.1.0" {
+		t.Fatalf("unexpected parsed request: %+v", parsed)
+	}
+	if len(parsed.RestartArgs) != len(wantArgs) {
+		t.Fatalf("unexpected restart args: %#v", parsed.RestartArgs)
+	}
+	for i := range wantArgs {
+		if parsed.RestartArgs[i] != wantArgs[i] {
+			t.Fatalf("restart arg %d = %q, want %q", i, parsed.RestartArgs[i], wantArgs[i])
+		}
+	}
+	if _, err := os.Stat(argsPath); !os.IsNotExist(err) {
+		t.Fatalf("restart args file should be removed after parsing")
+	}
+
+	// Missing SHA256 flag must fail
+	_, errMissingSHA := parseApplyArgs([]string{
+		"helper.exe",
+		updateApplyFlag,
+		updateArchiveFlag, filepath.Join(tempDir, "update.zip"),
+		updateTargetFlag, filepath.Join(tempDir, "GBF_Accelerator.exe"),
+	})
+	if errMissingSHA == nil {
+		t.Fatal("expected error when SHA256 flag is missing")
+	}
+}
+
+func TestApplyWindowsExecutable_RestartFailure_RollbackRestoresOldVersion(t *testing.T) {
+	tempDir := t.TempDir()
+	targetPath := filepath.Join(tempDir, "GBF_Accelerator.exe")
+	origContent := []byte("ORIGINAL_OLD_VERSION_DATA_12345")
+	if err := os.WriteFile(targetPath, origContent, 0755); err != nil {
+		t.Fatalf("failed to create target file: %v", err)
+	}
+
+	// Create an archive containing an invalid non-runnable executable
+	archivePath := filepath.Join(tempDir, "update.zip")
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+	w, err := zw.Create("GBF_Accelerator.exe")
+	if err != nil {
+		t.Fatalf("failed to create zip entry: %v", err)
+	}
+	// Write dummy text which is guaranteed to fail Windows execution with %1 is not a valid Win32 application
+	_, _ = w.Write([]byte("NOT_A_VALID_WIN32_PE_BINARY"))
+	_ = zw.Close()
+	if err := os.WriteFile(archivePath, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("failed to write archive: %v", err)
+	}
+
+	// Execute applyWindowsExecutable: restart must fail, and rollback must restore the original file
+	err = applyWindowsExecutable(archivePath, targetPath, nil)
+	if err == nil {
+		t.Fatalf("expected error from launching non-executable dummy file, got nil")
+	}
+
+	restoredContent, readErr := os.ReadFile(targetPath)
+	if readErr != nil {
+		t.Fatalf("failed to read restored target file: %v", readErr)
+	}
+	if !bytes.Equal(restoredContent, origContent) {
+		t.Fatalf("rollback did not restore original content; got %q, want %q", restoredContent, origContent)
+	}
+
+	backupPath := targetPath + ".update-backup"
+	if _, statErr := os.Stat(backupPath); !os.IsNotExist(statErr) {
+		t.Fatalf("backup file should be restored back or removed, but still exists: %v", backupPath)
+	}
+}
+
+func TestPrepareRestartArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "empty args adds minimized",
+			in:   nil,
+			want: []string{"-minimized"},
+		},
+		{
+			name: "preserves general flags and appends minimized",
+			in:   []string{"-proxy-port", "8124", "-cache-dir", "C:\\cache"},
+			want: []string{"-proxy-port", "8124", "-cache-dir", "C:\\cache", "-minimized"},
+		},
+		{
+			name: "strips open-browser flag variants",
+			in:   []string{"-open-browser", "-proxy-port", "8124", "--open-browser=true"},
+			want: []string{"-proxy-port", "8124", "-minimized"},
+		},
+		{
+			name: "does not duplicate existing minimized flag",
+			in:   []string{"--minimized", "-proxy-port", "8124"},
+			want: []string{"--minimized", "-proxy-port", "8124"},
+		},
+		{
+			name: "replaces explicit minimized false with minimized",
+			in:   []string{"-minimized=false", "-proxy-port", "8124"},
+			want: []string{"-proxy-port", "8124", "-minimized"},
+		},
+		{
+			name: "preserves explicit minimized true",
+			in:   []string{"-minimized=true", "-proxy-port", "8124"},
+			want: []string{"-minimized=true", "-proxy-port", "8124"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := PrepareRestartArgs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("PrepareRestartArgs(%v) returned len %d, want len %d (%v)", tc.in, len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("PrepareRestartArgs(%v)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseApplyArgs_ParentPID(t *testing.T) {
+	tempDir := t.TempDir()
+	parsed, err := parseApplyArgs([]string{
+		"helper.exe",
+		updateApplyFlag,
+		updateArchiveFlag, filepath.Join(tempDir, "update.zip"),
+		updateTargetFlag, filepath.Join(tempDir, "GBF_Accelerator.exe"),
+		updateSHA256Flag, "abcdef",
+		updateParentPIDFlag, "43210",
+	})
+	if err != nil {
+		t.Fatalf("parseApplyArgs with parent PID failed: %v", err)
+	}
+	if parsed.ParentPID != 43210 {
+		t.Fatalf("expected ParentPID 43210, got %d", parsed.ParentPID)
+	}
+
+	_, errInvalid := parseApplyArgs([]string{
+		"helper.exe",
+		updateApplyFlag,
+		updateArchiveFlag, filepath.Join(tempDir, "update.zip"),
+		updateTargetFlag, filepath.Join(tempDir, "GBF_Accelerator.exe"),
+		updateSHA256Flag, "abcdef",
+		updateParentPIDFlag, "not-a-pid",
+	})
+	if errInvalid == nil {
+		t.Fatal("expected error for invalid parent PID")
+	}
+}
+
+func TestWaitForParentExit(t *testing.T) {
+	// 1. Non-positive PID or non-existent PID returns immediately
+	if err := waitForParentExit(0, 100*time.Millisecond); err != nil {
+		t.Fatalf("expected nil for pid 0, got %v", err)
+	}
+
+	// 2. Current process is still alive -> must time out when waited on with short timeout
+	if err := waitForParentExit(os.Getpid(), 150*time.Millisecond); err == nil {
+		t.Fatal("expected timeout error when waiting for still-running current process")
+	}
+
+	// 3. Spawn a short-lived child process and verify waitForParentExit waits until it exits
+	exe, err := os.Executable()
+	if err == nil {
+		cmd := exec.Command(exe, "-test.run=^TestNonExistentHelperProcess$")
+		if startErr := cmd.Start(); startErr == nil {
+			pid := cmd.Process.Pid
+			go func() {
+				_ = cmd.Wait()
+			}()
+			if waitErr := waitForParentExit(pid, 5*time.Second); waitErr != nil {
+				t.Fatalf("expected waitForParentExit to succeed after short-lived process exited, got: %v", waitErr)
+			}
+		}
+	}
+}
+
+func TestExtractMacBundle_NestedRootAndPermissions(t *testing.T) {
+	tempDir := t.TempDir()
+	archivePath := filepath.Join(tempDir, "mac-release.zip")
+
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+
+	binHeader := &zip.FileHeader{
+		Name:   "release-v2.4.2/GBF_Accelerator.app/Contents/MacOS/GBF_Accelerator",
+		Method: zip.Deflate,
+	}
+	binHeader.SetMode(0644)
+	wBin, err := zw.CreateHeader(binHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = wBin.Write([]byte("mach-o-binary"))
+
+	plistHeader := &zip.FileHeader{
+		Name:   "release-v2.4.2/GBF_Accelerator.app/Contents/Info.plist",
+		Method: zip.Deflate,
+	}
+	plistHeader.SetMode(0644)
+	wPlist, err := zw.CreateHeader(plistHeader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = wPlist.Write([]byte("<plist/>"))
+
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archivePath, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stageDir := filepath.Join(tempDir, "stage")
+	if err := os.MkdirAll(stageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stageBundle, err := extractMacBundle(archivePath, stageDir)
+	if err != nil {
+		t.Fatalf("extractMacBundle failed: %v", err)
+	}
+	wantBundle := filepath.Join(stageDir, "GBF_Accelerator.app")
+	if stageBundle != wantBundle {
+		t.Fatalf("stageBundle = %q, want %q", stageBundle, wantBundle)
+	}
+
+	binPath := filepath.Join(stageBundle, "Contents", "MacOS", "GBF_Accelerator")
+	binData, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("failed to read extracted binary: %v", err)
+	}
+	if string(binData) != "mach-o-binary" {
+		t.Fatalf("unexpected binary data: %q", string(binData))
+	}
+
+	if runtime.GOOS != "windows" {
+		binInfo, err := os.Stat(binPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if binInfo.Mode().Perm()&0111 == 0 {
+			t.Fatalf("expected Contents/MacOS binary to be executable, got mode %v", binInfo.Mode().Perm())
+		}
+
+		plistPath := filepath.Join(stageBundle, "Contents", "Info.plist")
+		plistInfo, err := os.Stat(plistPath)
+		if err != nil {
+			t.Fatalf("failed to stat extracted Info.plist: %v", err)
+		}
+		if plistInfo.Mode().Perm() != 0644 {
+			t.Fatalf("expected Info.plist mode 0644, got %o", plistInfo.Mode().Perm())
+		}
+	}
+}
+
+
+

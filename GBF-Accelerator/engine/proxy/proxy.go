@@ -1,0 +1,4880 @@
+package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"gbf-proxy/cache"
+	"gbf-proxy/cert"
+	"gbf-proxy/config"
+	"gbf-proxy/telemetry"
+)
+
+type bufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
+
+type upstreamClients struct {
+	api   *http.Client
+	asset *http.Client
+	proxy string
+}
+
+func (u *upstreamClients) closeIdle() {
+	if u == nil {
+		return
+	}
+	if u.api != nil {
+		if tr, ok := u.api.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+	if u.asset != nil {
+		if tr, ok := u.asset.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
+type ProxyServer struct {
+	cfgMgr        *config.Manager
+	certMgr       *cert.Manager
+	cacheMgr      *cache.Manager
+	stats         *telemetry.Stats
+	prefetch      *PrefetchEngine
+	listener      net.Listener
+	listenerGen   uint64
+	serveLoopWg   sync.WaitGroup
+	mu            sync.RWMutex
+	connMu        sync.Mutex
+	activeConns   map[net.Conn]struct{}
+	apiClient     atomic.Pointer[http.Client]
+	assetClient   atomic.Pointer[http.Client]
+	primaryClient atomic.Pointer[upstreamClients]
+	backupClient  atomic.Pointer[upstreamClients]
+	upstreamProxy atomic.Pointer[string]
+	failover      *failoverManager
+	failoverNotifyFn func(title, message string)
+	notifyMu         sync.Mutex
+	lastNotifyAt     time.Time
+	running          bool
+	closedChan       chan struct{}
+
+	// Test synchronization hooks (nil in production)
+	beforeSingleFlightDoContext func(key string, isHead bool)
+	insideSingleFlightHeadHook  func(key string)
+
+	// Resolver and dialer hooks (nil in production; used for testing and controlled resolution)
+	lookupIPFn    func(ctx context.Context, host string) ([]net.IP, error)
+	dialContextFn func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func (s *ProxyServer) resolveHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	if s.lookupIPFn != nil {
+		return s.lookupIPFn(ctx, host)
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		ips[i] = a.IP
+	}
+	return ips, nil
+}
+
+func (s *ProxyServer) dialTarget(ctx context.Context, network, addr string) (net.Conn, error) {
+	if s.dialContextFn != nil {
+		return s.dialContextFn(ctx, network, addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+const (
+	FailoverNotifyTitle   = "GBF-Accelerator 线路切换"
+	FailoverNotifyMessage = "检测到主上游连接故障，已自动切换至备用上游。当前页面如出现加载或通信异常，请按 F5 刷新。"
+)
+
+func NewProxyServer(cfgMgr *config.Manager, certMgr *cert.Manager, cacheMgr *cache.Manager, stats *telemetry.Stats) *ProxyServer {
+	s := &ProxyServer{
+		cfgMgr: cfgMgr, certMgr: certMgr, cacheMgr: cacheMgr, stats: stats,
+		closedChan: make(chan struct{}), activeConns: make(map[net.Conn]struct{}), failover: newFailoverManager(),
+	}
+	s.prefetch = newPrefetchEngine(s)
+	initialCfg := cfgMgr.Get()
+	s.updateClients(&initialCfg)
+	cfgMgr.OnUpdate(func(c *config.Config) { s.updateClients(c) })
+	return s
+}
+
+func buildUpstreamClients(c *config.Config, proxyURL string) *upstreamClients {
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	var dialFunc func(context.Context, string, string) (net.Conn, error)
+	normalized := strings.TrimSpace(proxyURL)
+	if strings.EqualFold(normalized, "direct") {
+		normalized = ""
+	} else if normalized != "" {
+		if u, err := url.Parse(normalized); err == nil {
+			switch strings.ToLower(u.Scheme) {
+			case "http", "https":
+				proxyFunc = http.ProxyURL(u)
+			case "socks5", "socks5h":
+				ph, pp := u.Hostname(), u.Port()
+				if pp == "" {
+					pp = "1080"
+				}
+				pa := net.JoinHostPort(ph, pp)
+				user, pass := "", ""
+				if u.User != nil {
+					user = u.User.Username()
+					pass, _ = u.User.Password()
+				}
+				dialFunc = func(ctx context.Context, network, target string) (net.Conn, error) {
+					t := 10 * time.Second
+					if d, ok := ctx.Deadline(); ok {
+						r := time.Until(d)
+						if r <= 0 {
+							return nil, ctx.Err()
+						}
+						if r < t {
+							t = r
+						}
+					}
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					conn, err := dialSOCKS5(pa, target, user, pass, t)
+					if err != nil {
+						return nil, err
+					}
+					if err := ctx.Err(); err != nil {
+						_ = conn.Close()
+						return nil, err
+					}
+					return conn, nil
+				}
+			}
+		}
+	}
+
+	apiMaxConn, apiMaxIdle := c.APIMaxConnections, c.APIMaxKeepalive
+	if apiMaxConn <= 0 {
+		apiMaxConn = 16
+	}
+	if apiMaxIdle <= 0 {
+		apiMaxIdle = 4
+	}
+	assetMaxConn, assetMaxIdle := c.AssetMaxConnections, c.AssetMaxKeepalive
+	if assetMaxConn <= 0 {
+		assetMaxConn = 32
+	}
+	if assetMaxIdle <= 0 {
+		assetMaxIdle = 16
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 15 * time.Second}
+
+	apiTr := &http.Transport{
+		Proxy: proxyFunc, DialContext: dialer.DialContext,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: !c.VerifyUpstreamTLS || c.ShimakazeMode},
+		MaxConnsPerHost: apiMaxConn, MaxIdleConns: apiMaxConn, MaxIdleConnsPerHost: apiMaxIdle,
+		IdleConnTimeout:   time.Duration(c.APIKeepaliveExpiry * float64(time.Second)),
+		ForceAttemptHTTP2: false, DisableCompression: true,
+	}
+	assetTr := &http.Transport{
+		Proxy: proxyFunc, DialContext: dialer.DialContext,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: !c.VerifyUpstreamTLS || c.ShimakazeMode},
+		MaxConnsPerHost: assetMaxConn, MaxIdleConns: assetMaxConn, MaxIdleConnsPerHost: assetMaxIdle,
+		IdleConnTimeout:   time.Duration(c.AssetKeepaliveExpiry * float64(time.Second)),
+		ForceAttemptHTTP2: true, DisableCompression: true,
+	}
+	if dialFunc != nil {
+		apiTr.Proxy, apiTr.DialContext = nil, dialFunc
+		assetTr.Proxy, assetTr.DialContext = nil, dialFunc
+	}
+	wrapAPITransportSingleAttempt(apiTr)
+	return &upstreamClients{
+		api: &http.Client{
+			Transport: apiTr,
+			Timeout:   45 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		asset: &http.Client{
+			Transport: assetTr,
+			Timeout:   45 * time.Second,
+		},
+		proxy: normalized,
+	}
+}
+
+func (s *ProxyServer) updateClients(c *config.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldPrimary, oldBackup := s.primaryClient.Load(), s.backupClient.Load()
+
+	primaryProxy := c.GetEffectiveUpstreamProxy()
+	if c.DirectMode {
+		primaryProxy = ""
+	}
+	backupProxy := strings.TrimSpace(c.BackupUpstreamProxy)
+	if c.DirectMode || !isSupportedFailoverProxy(backupProxy) {
+		backupProxy = ""
+	}
+
+	newPrimary := buildUpstreamClients(c, primaryProxy)
+	var newBackup *upstreamClients
+	if backupProxy != "" {
+		newBackup = buildUpstreamClients(c, backupProxy)
+	}
+
+	s.primaryClient.Store(newPrimary)
+	s.backupClient.Store(newBackup)
+	s.failover.configure(
+		c.EnableUpstreamFailover, newBackup != nil,
+		time.Duration(c.UpstreamFailoverThresholdMS)*time.Millisecond,
+		c.UpstreamFailoverConsecutiveFailures,
+		time.Duration(c.UpstreamFailoverCooldownSeconds)*time.Second,
+		c.UpstreamFailoverAutoRecover,
+	)
+	s.activateRouteLocked(s.failover.activeRoute())
+
+	if oldPrimary != nil {
+		oldPrimary.closeIdle()
+	}
+	if oldBackup != nil && oldBackup != newBackup {
+		oldBackup.closeIdle()
+	}
+}
+
+func isSupportedFailoverProxy(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if strings.EqualFold(raw, "direct") {
+		return true
+	}
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *ProxyServer) activateRouteLocked(route failoverRoute) {
+	pair := s.primaryClient.Load()
+	activeProxy := ""
+	if route == failoverRouteBackup {
+		if backup := s.backupClient.Load(); backup != nil {
+			pair, activeProxy = backup, backup.proxy
+		} else {
+			route = failoverRoutePrimary
+		}
+	}
+	if route == failoverRoutePrimary && pair != nil {
+		activeProxy = pair.proxy
+	}
+	if pair == nil {
+		return
+	}
+	s.apiClient.Store(pair.api)
+	s.assetClient.Store(pair.asset)
+	v := activeProxy
+	s.upstreamProxy.Store(&v)
+}
+
+func (s *ProxyServer) activateRoute(route failoverRoute) {
+	s.mu.Lock()
+	oldAPI, oldAsset := s.apiClient.Load(), s.assetClient.Load()
+	s.activateRouteLocked(route)
+	newAPI, newAsset := s.apiClient.Load(), s.assetClient.Load()
+	s.mu.Unlock()
+	if oldAPI != nil && oldAPI != newAPI {
+		if tr, ok := oldAPI.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+	if oldAsset != nil && oldAsset != newAsset {
+		if tr, ok := oldAsset.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
+func (s *ProxyServer) getRouteForRequest(method string) (failoverRoute, bool) {
+	if s.failover == nil {
+		return failoverRoutePrimary, false
+	}
+	return s.failover.routeForRequest(method == http.MethodGet || method == http.MethodHead, time.Now())
+}
+func (s *ProxyServer) getAPIClient() *http.Client   { return s.apiClient.Load() }
+func (s *ProxyServer) getAssetClient() *http.Client { return s.assetClient.Load() }
+
+func (s *ProxyServer) resolveAPIClientForRoute(r failoverRoute, trial bool) *http.Client {
+	if r == failoverRouteBackup {
+		if pair := s.backupClient.Load(); pair != nil && pair.api != nil {
+			return pair.api
+		}
+	}
+	cur := s.apiClient.Load()
+	backup := s.backupClient.Load()
+	if trial || cur == nil || (backup != nil && cur == backup.api) {
+		if pair := s.primaryClient.Load(); pair != nil && pair.api != nil {
+			return pair.api
+		}
+	}
+	return cur
+}
+
+func (s *ProxyServer) resolveAssetClientForRoute(r failoverRoute, trial bool) *http.Client {
+	if r == failoverRouteBackup {
+		if pair := s.backupClient.Load(); pair != nil && pair.asset != nil {
+			return pair.asset
+		}
+	}
+	cur := s.assetClient.Load()
+	backup := s.backupClient.Load()
+	if trial || cur == nil || (backup != nil && cur == backup.asset) {
+		if pair := s.primaryClient.Load(); pair != nil && pair.asset != nil {
+			return pair.asset
+		}
+	}
+	return cur
+}
+
+func (s *ProxyServer) getAPIClientForRequest(method string) (*http.Client, failoverRoute, bool) {
+	r, trial := s.getRouteForRequest(method)
+	return s.resolveAPIClientForRoute(r, trial), r, trial
+}
+
+func (s *ProxyServer) getAssetClientForRequest(method string) (*http.Client, failoverRoute, bool) {
+	r, trial := s.getRouteForRequest(method)
+	return s.resolveAssetClientForRoute(r, trial), r, trial
+}
+
+func (s *ProxyServer) SetFailoverNotifyFunc(fn func(title, message string)) {
+	s.notifyMu.Lock()
+	defer s.notifyMu.Unlock()
+	s.failoverNotifyFn = fn
+}
+
+func (s *ProxyServer) handleFailoverTransition(tr *failoverTransition) {
+	if tr == nil {
+		return
+	}
+	s.activateRoute(tr.to)
+	s.logFailoverTransition(tr)
+	s.notifyFailoverTransition(tr)
+}
+
+func (s *ProxyServer) notifyFailoverTransition(tr *failoverTransition) {
+	if tr == nil || tr.from != failoverRoutePrimary || tr.to != failoverRouteBackup {
+		return
+	}
+	if s.cfgMgr != nil && !s.cfgMgr.Get().UpstreamFailoverNotification {
+		return
+	}
+
+	s.notifyMu.Lock()
+	now := time.Now()
+	if !s.lastNotifyAt.IsZero() && now.Sub(s.lastNotifyAt) < 60*time.Second {
+		s.notifyMu.Unlock()
+		return
+	}
+	s.lastNotifyAt = now
+	fn := s.failoverNotifyFn
+	s.notifyMu.Unlock()
+
+	if fn != nil {
+		go fn(FailoverNotifyTitle, FailoverNotifyMessage)
+	}
+}
+
+func (s *ProxyServer) observeUpstream(r failoverRoute, trial bool, elapsed time.Duration, err error) {
+	if s.failover == nil {
+		return
+	}
+	if tr := s.failover.observe(r, trial, elapsed, err, time.Now()); tr != nil {
+		s.handleFailoverTransition(tr)
+	}
+}
+func (s *ProxyServer) logFailoverTransition(t *failoverTransition) {
+	if t != nil && s.stats != nil {
+		s.stats.Log("INFO", fmt.Sprintf("[UPSTREAM] %s -> %s (%s)", t.from.String(), t.to.String(), t.reason))
+	}
+}
+
+type inFlightTracker struct {
+	mu        sync.Mutex
+	timer     *time.Timer
+	threshold time.Duration
+	stopped   bool
+	fired     atomic.Bool
+	start     time.Time
+}
+
+func (t *inFlightTracker) stop() bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	if !t.stopped {
+		t.stopped = true
+		if t.timer != nil {
+			t.timer.Stop()
+		}
+	}
+	t.mu.Unlock()
+	return !t.fired.Load()
+}
+
+func (t *inFlightTracker) pause() {
+	if t == nil || t.fired.Load() {
+		return
+	}
+	t.mu.Lock()
+	if !t.stopped && t.timer != nil {
+		t.timer.Stop()
+	}
+	t.mu.Unlock()
+}
+
+func (t *inFlightTracker) resume(s *ProxyServer, route failoverRoute, trial bool, upstreamElapsed time.Duration) {
+	if t == nil || t.fired.Load() {
+		return
+	}
+	rem := t.threshold - upstreamElapsed
+	if rem <= 0 {
+		if t.fired.CompareAndSwap(false, true) {
+			t.stop()
+			s.observeInFlightTimeout(route, trial)
+		}
+		return
+	}
+	t.mu.Lock()
+	if !t.stopped && !t.fired.Load() && t.timer != nil {
+		t.timer.Reset(rem)
+	}
+	t.mu.Unlock()
+}
+
+func (s *ProxyServer) startInFlightWatch(route failoverRoute, trial bool) *inFlightTracker {
+	if s.failover == nil || !s.failover.isEnabled() || route != failoverRoutePrimary {
+		return nil
+	}
+	threshold := s.failover.getThreshold()
+	if threshold <= 0 {
+		return nil
+	}
+
+	tracker := &inFlightTracker{threshold: threshold, start: time.Now()}
+	tracker.timer = time.AfterFunc(threshold, func() {
+		if tracker.fired.CompareAndSwap(false, true) {
+			s.observeInFlightTimeout(route, trial)
+		}
+	})
+	return tracker
+}
+
+func (s *ProxyServer) observeInFlightTimeout(route failoverRoute, trial bool) {
+	if s.failover == nil {
+		return
+	}
+	if tr := s.failover.observeInFlightTimeout(route, trial, time.Now()); tr != nil {
+		s.handleFailoverTransition(tr)
+	}
+}
+
+func (s *ProxyServer) finishInFlightWatch(tracker *inFlightTracker, route failoverRoute, trial bool, elapsed time.Duration, err error) {
+	if tracker == nil {
+		s.observeUpstream(route, trial, elapsed, err)
+		return
+	}
+	if tracker.stop() {
+		s.observeUpstream(route, trial, elapsed, err)
+		return
+	}
+	// The watchdog already fired and recorded a soft latency failure for this
+	// request. A clean completion (err == nil) must NOT be re-observed to avoid
+	// double counting. A genuine hard error on a non-trial request is an
+	// immediate-failover trigger and must NOT be swallowed: it still reaches
+	// observe(), whose route != active guard makes this call idempotent when the
+	// watchdog already switched the route to backup. For recovery trials
+	// (trial == true), observeInFlightTimeout already terminated the trial and
+	// cleared trialInFlight, so a late error must not re-enter observe() and
+	// clobber a subsequent recovery trial.
+	if err != nil && !trial {
+		s.observeUpstream(route, trial, elapsed, err)
+	}
+}
+func (s *ProxyServer) GetEffectiveUpstreamProxy() string {
+	if p := s.upstreamProxy.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+func (s *ProxyServer) GetUpstreamStatus() UpstreamRuntimeStatus {
+	if s.failover == nil {
+		return UpstreamRuntimeStatus{Active: "primary"}
+	}
+	return s.failover.status()
+}
+
+func (s *ProxyServer) telemetryEnabled() bool {
+	return s.cfgMgr != nil && s.cfgMgr.Get().EnableAPITelemetry
+}
+
+func (s *ProxyServer) tracedRequest(req *http.Request) *http.Request {
+	if !s.telemetryEnabled() {
+		return req
+	}
+	return s.tracedRequestWithCallback(req, nil)
+}
+
+func (s *ProxyServer) tracedRequestWithCallback(req *http.Request, onGotConn func(reused bool)) *http.Request {
+	if !s.telemetryEnabled() {
+		return req
+	}
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			s.stats.RecordConnReuse(info.Reused)
+			if onGotConn != nil {
+				onGotConn(info.Reused)
+			}
+		},
+	}
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+}
+
+// nonReplayableBody is a zero-length io.ReadCloser distinct from nil and http.NoBody.
+// Setting Request.Body to nonReplayableBody inside WroteHeaders (after transferWriter
+// has already computed wire Content-Length / Transfer-Encoding headers) prevents
+// Go's net/http.Transport.shouldRetryRequest from treating empty-body, http.NoBody,
+// GET, or Idempotency-Key requests as replayable on broken reused connections.
+type nonReplayableBody struct{}
+
+func (nonReplayableBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (nonReplayableBody) Close() error             { return nil }
+
+var errTransportReplayBlocked = errors.New("http transport implicit replay blocked")
+
+type apiAttemptCounterKey struct{}
+
+// wrapAPITransportSingleAttempt wraps tr.Proxy so that within a single Client.Do call,
+// if Transport.roundTrip loops to a second iteration (for example on nothingWrittenError
+// when an idle connection failed before WroteHeaders), connectMethodForRequest aborts
+// immediately before t.getConn or t.queueForIdleConn can acquire a second connection.
+func wrapAPITransportSingleAttempt(tr *http.Transport) {
+	if tr == nil {
+		return
+	}
+	baseProxy := tr.Proxy
+	tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		if counter, ok := req.Context().Value(apiAttemptCounterKey{}).(*atomic.Int32); ok && counter != nil {
+			if counter.Add(1) > 1 {
+				return nil, errTransportReplayBlocked
+			}
+		}
+		if baseProxy != nil {
+			return baseProxy(req)
+		}
+		return nil, nil
+	}
+}
+
+func newUpstreamAPIRequest(ctx context.Context, origReq *http.Request, upURL string, bodyBytes []byte) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var bodyReader io.Reader
+	if len(bodyBytes) > 0 {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	upReq, err := http.NewRequestWithContext(ctx, origReq.Method, upURL, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	if len(bodyBytes) == 0 && origReq.Body == http.NoBody {
+		upReq.Body = http.NoBody
+	}
+	upReq.GetBody = nil
+	return upReq, nil
+}
+
+func (s *ProxyServer) prepareAPIRequestTrace(req *http.Request, onGotConn func(reused bool)) (*http.Request, context.CancelCauseFunc) {
+	req.GetBody = nil
+	attemptCtx, cancelAttempt := context.WithCancelCause(req.Context())
+	var proxyCalls atomic.Int32
+	var getConnCalls atomic.Int32
+	attemptCtx = context.WithValue(attemptCtx, apiAttemptCounterKey{}, &proxyCalls)
+	var tracedReq *http.Request
+	trace := &httptrace.ClientTrace{
+		GetConn: func(_ string) {
+			if getConnCalls.Add(1) > 1 {
+				if tracedReq != nil && (tracedReq.Body == nil || tracedReq.Body == http.NoBody) {
+					tracedReq.Body = nonReplayableBody{}
+				}
+				cancelAttempt(errTransportReplayBlocked)
+			}
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			if getConnCalls.Load() > 1 {
+				if info.Conn != nil {
+					_ = info.Conn.Close()
+				}
+				cancelAttempt(errTransportReplayBlocked)
+				return
+			}
+			if s.telemetryEnabled() {
+				s.stats.RecordConnReuse(info.Reused)
+			}
+			if onGotConn != nil {
+				onGotConn(info.Reused)
+			}
+		},
+		WroteHeaders: func() {
+			if tracedReq != nil && (tracedReq.Body == nil || tracedReq.Body == http.NoBody) {
+				tracedReq.Body = nonReplayableBody{}
+			}
+		},
+	}
+	tracedReq = req.WithContext(httptrace.WithClientTrace(attemptCtx, trace))
+	return tracedReq, cancelAttempt
+}
+
+func (s *ProxyServer) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return nil
+	}
+
+	cfg := s.cfgMgr.Get()
+	bindHost := s.cfgMgr.GetEffectiveListenHost()
+	addr := fmt.Sprintf("%s:%d", bindHost, cfg.ListenPort)
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if s.prefetch != nil {
+			s.prefetch.Stop()
+		}
+		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+
+	s.listener = ln
+	s.listenerGen++
+	s.running = true
+	s.closedChan = make(chan struct{})
+	s.connMu.Lock()
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	s.connMu.Unlock()
+	if s.prefetch == nil || s.prefetch.IsStopped() {
+		s.prefetch = newPrefetchEngine(s)
+	}
+
+	s.serveLoopWg.Add(1)
+	go s.serveLoop(ln, s.listenerGen)
+	return nil
+}
+
+func (s *ProxyServer) ReloadListener(newHost string, newPort int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return nil
+	}
+
+	newAddr := fmt.Sprintf("%s:%d", newHost, newPort)
+	if s.listener != nil && s.listener.Addr().String() == newAddr {
+		return nil
+	}
+
+	oldLn := s.listener
+	var oldAddr string
+	var oldPort int
+	if oldLn != nil {
+		oldAddr = oldLn.Addr().String()
+		if _, pStr, err := net.SplitHostPort(oldAddr); err == nil {
+			oldPort, _ = strconv.Atoi(pStr)
+		}
+	}
+
+	// AGENTS.md P0.2:
+	// 不同端口: Listen new -> 成功 -> retire old 缩短中断。
+	// 同端口变更: 串行 Close old -> Listen new -> (成功 switch gen / 失败 rollback old)。
+	if oldLn != nil && oldAddr != "" && oldPort != newPort {
+		newLn, err := net.Listen("tcp", newAddr)
+		if err != nil {
+			// New listener failed to bind. Old listener is untouched and continues serving.
+			return fmt.Errorf("failed to listen on %s: %w", newAddr, err)
+		}
+
+		_ = oldLn.Close()
+		s.listener = newLn
+		s.listenerGen++
+		s.serveLoopWg.Add(1)
+		go s.serveLoop(newLn, s.listenerGen)
+		if s.stats != nil {
+			s.stats.Log("INFO", fmt.Sprintf("[PROXY] 监听地址已动态重载至: %s (generation: %d)", newAddr, s.listenerGen))
+		}
+		return nil
+	}
+
+	if oldLn != nil {
+		_ = oldLn.Close()
+	}
+
+	newLn, err := net.Listen("tcp", newAddr)
+	if err != nil {
+		// Rollback to old listener if available
+		if oldAddr != "" {
+			if rollbackLn, rErr := net.Listen("tcp", oldAddr); rErr == nil {
+				s.listener = rollbackLn
+				s.listenerGen++
+				s.serveLoopWg.Add(1)
+				go s.serveLoop(rollbackLn, s.listenerGen)
+				return fmt.Errorf("failed to listen on %s: %w (rolled back to %s)", newAddr, err, oldAddr)
+			} else {
+				// Double failure (H6): both new bind and rollback failed.
+				// Set listener=nil, running=false, listenerGen++ so serveLoop exits cleanly.
+				s.listener = nil
+				s.running = false
+				s.listenerGen++
+				return fmt.Errorf("failed to listen on %s: %v (rollback to %s failed: %v)", newAddr, err, oldAddr, rErr)
+			}
+		}
+		return fmt.Errorf("failed to listen on %s: %w", newAddr, err)
+	}
+
+	s.listener = newLn
+	s.listenerGen++
+	s.serveLoopWg.Add(1)
+	go s.serveLoop(newLn, s.listenerGen)
+	if s.stats != nil {
+		s.stats.Log("INFO", fmt.Sprintf("[PROXY] 监听地址已动态重载至: %s (generation: %d)", newAddr, s.listenerGen))
+	}
+	return nil
+}
+
+func (s *ProxyServer) ListenerAddr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return ""
+}
+
+func (s *ProxyServer) Stop() {
+	s.mu.Lock()
+	if s.prefetch != nil {
+		s.prefetch.Stop()
+	}
+	if !s.running {
+		s.mu.Unlock()
+		return
+	}
+	s.running = false
+	s.listenerGen++
+	if s.listener != nil {
+		_ = s.listener.Close()
+		s.listener = nil
+	}
+	if api := s.apiClient.Load(); api != nil {
+		if tr, ok := api.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+	if asset := s.assetClient.Load(); asset != nil {
+		if tr, ok := asset.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+
+	// Stop must terminate already-accepted client connections too. Closing only
+	// the listener leaves existing HTTP Keep-Alive / CONNECT tunnels usable.
+	s.connMu.Lock()
+	active := make([]net.Conn, 0, len(s.activeConns))
+	for conn := range s.activeConns {
+		active = append(active, conn)
+		delete(s.activeConns, conn)
+	}
+	s.connMu.Unlock()
+
+	select {
+	case <-s.closedChan:
+	default:
+		close(s.closedChan)
+	}
+	s.mu.Unlock()
+
+	for _, conn := range active {
+		_ = conn.Close()
+	}
+}
+
+func (s *ProxyServer) PrefetchQueueLen() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.prefetch != nil {
+		return s.prefetch.QueueLen()
+	}
+	return 0
+}
+
+func (s *ProxyServer) IsRunning() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.running
+}
+
+func (s *ProxyServer) WaitServeLoops(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.serveLoopWg.Wait()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// WaitPrefetchWorkers waits for background prefetch workers to exit within the specified timeout.
+// Returns true if workers exited before timeout, or false otherwise.
+func (s *ProxyServer) WaitPrefetchWorkers(timeout time.Duration) bool {
+	s.mu.RLock()
+	pe := s.prefetch
+	s.mu.RUnlock()
+	if pe == nil {
+		return true
+	}
+	return pe.WaitTimeout(timeout)
+}
+
+func (s *ProxyServer) trackConn(conn net.Conn) bool {
+	// Keep the same lock order as Stop: s.mu -> connMu. This makes the
+	// Accept-vs-Stop race atomic without introducing a lock inversion.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.running {
+		_ = conn.Close()
+		return false
+	}
+
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	s.activeConns[conn] = struct{}{}
+	return true
+}
+
+func (s *ProxyServer) untrackConn(conn net.Conn) {
+	s.connMu.Lock()
+	delete(s.activeConns, conn)
+	s.connMu.Unlock()
+}
+
+func (s *ProxyServer) serveLoop(ln net.Listener, gen uint64) {
+	defer s.serveLoopWg.Done()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			s.mu.RLock()
+			running := s.running
+			currentGen := s.listenerGen
+			s.mu.RUnlock()
+
+			if !running || gen != currentGen {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+
+		// Check LAN ACL
+		if !s.isClientAllowed(conn.RemoteAddr()) {
+			_ = conn.Close()
+			continue
+		}
+		if !s.trackConn(conn) {
+			continue
+		}
+
+		go s.handleConnection(conn)
+	}
+}
+
+func (s *ProxyServer) isClientAllowed(addr net.Addr) bool {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	ip := tcpAddr.IP
+	if ip.IsLoopback() {
+		return true
+	}
+
+	cfg := s.cfgMgr.Get()
+	if !cfg.AllowLAN {
+		return false
+	}
+
+	// Permitted LAN ranges: RFC 1918, link-local, ULA
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	return false
+}
+
+func (s *ProxyServer) handleConnection(conn net.Conn) {
+	defer s.untrackConn(conn)
+	defer conn.Close()
+
+	br := bufio.NewReader(conn)
+	for {
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+
+		// 1. CONNECT tunnel (HTTPS proxy request)
+		if req.Method == http.MethodConnect {
+			s.handleConnect(conn, br, req)
+			return
+		}
+
+		// 2. Plain HTTP request (ca.crt, proxy.pac, mobile landing, or plain proxy)
+		keepAlive := s.handlePlainHTTP(conn, req)
+		if !keepAlive || req.Close {
+			return
+		}
+	}
+}
+
+func (s *ProxyServer) handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request) {
+	target := req.RequestURI
+	if target == "" && req.URL != nil && req.URL.Host != "" {
+		target = req.URL.Host
+	}
+	if target == "" {
+		target = req.Host
+	}
+	host := target
+	if strings.IndexByte(target, ':') != -1 {
+		if h, _, err := net.SplitHostPort(target); err == nil {
+			host = h
+		}
+	}
+	host = strings.ToLower(strings.TrimRight(strings.Trim(host, "[]"), "."))
+
+	clientIP := "127.0.0.1"
+	if cAddr := conn.RemoteAddr(); cAddr != nil {
+		if ch, _, err := net.SplitHostPort(cAddr.String()); err == nil {
+			clientIP = ch
+		}
+	}
+
+	// Check if this host should be MITM'd or Passthrough
+	if isPassthroughHost(host) || !isGBFDomain(host) {
+		s.stats.Log("INFO", fmt.Sprintf("[CONNECT] [%s] %s -> TUNNEL", clientIP, target))
+		s.handlePassthroughTunnel(conn, br, target)
+		return
+	}
+
+	s.stats.Log("INFO", fmt.Sprintf("[CONNECT] [%s] %s -> MITM", clientIP, target))
+
+	// Send 200 Connection Established for MITM
+	if _, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
+
+	// MITM TLS termination using bufferedConn to preserve any early data in br
+	bConn := &bufferedConn{Conn: conn, r: br}
+	tlsConfig := s.certMgr.GetTLSConfig()
+	tlsConn := tls.Server(bConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return
+	}
+	defer tlsConn.Close()
+
+	tlsReader := bufio.NewReader(tlsConn)
+	for {
+		clientReq, err := http.ReadRequest(tlsReader)
+		if err != nil {
+			break
+		}
+
+		keepAlive := s.handleDecryptedRequest(tlsConn, clientReq, host)
+		if !keepAlive || clientReq.Close {
+			break
+		}
+	}
+}
+
+func dialSOCKS5(proxyAddr, targetAddr, username, password string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxyAddr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	defer conn.SetDeadline(time.Time{})
+
+	// 1. Handshake greeting
+	methods := []byte{0x00}
+	if username != "" {
+		methods = []byte{0x00, 0x02}
+	}
+	greeting := append([]byte{0x05, byte(len(methods))}, methods...)
+	if _, err := conn.Write(greeting); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if resp[0] != 0x05 || resp[1] == 0xff {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 auth negotiation failed")
+	}
+
+	// 2. Auth if requested
+	if resp[1] == 0x02 {
+		authBuf := []byte{0x01, byte(len(username))}
+		authBuf = append(authBuf, []byte(username)...)
+		authBuf = append(authBuf, byte(len(password)))
+		authBuf = append(authBuf, []byte(password)...)
+		if _, err := conn.Write(authBuf); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if authResp[1] != 0x00 {
+			_ = conn.Close()
+			return nil, fmt.Errorf("socks5 auth failed")
+		}
+	}
+
+	// 3. Connect request: 0x05, 0x01 (CONNECT), 0x00 (RSV)
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("invalid target port: %s", portStr)
+	}
+
+	reqBuf := []byte{0x05, 0x01, 0x00}
+	ip := net.ParseIP(host)
+	if ip4 := ip.To4(); ip4 != nil {
+		reqBuf = append(reqBuf, 0x01)
+		reqBuf = append(reqBuf, ip4...)
+	} else if ip6 := ip.To16(); ip6 != nil {
+		reqBuf = append(reqBuf, 0x04)
+		reqBuf = append(reqBuf, ip6...)
+	} else {
+		reqBuf = append(reqBuf, 0x03, byte(len(host)))
+		reqBuf = append(reqBuf, []byte(host)...)
+	}
+	reqBuf = append(reqBuf, byte(port>>8), byte(port&0xff))
+
+	if _, err := conn.Write(reqBuf); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	replyHeader := make([]byte, 4)
+	if _, err := io.ReadFull(conn, replyHeader); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if replyHeader[1] != 0x00 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 connect failed with status 0x%02x", replyHeader[1])
+	}
+
+	// Drain bound address
+	var toRead int
+	switch replyHeader[3] {
+	case 0x01:
+		toRead = 4 + 2
+	case 0x04:
+		toRead = 16 + 2
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		toRead = int(lenBuf[0]) + 2
+	default:
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 unknown address type 0x%02x", replyHeader[3])
+	}
+
+	drainBuf := make([]byte, toRead)
+	if _, err := io.ReadFull(conn, drainBuf); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+var tunnelBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+var streamBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 512*1024)
+		return &b
+	},
+}
+
+func (s *ProxyServer) handlePassthroughTunnel(clientConn net.Conn, clientReader io.Reader, target string) {
+	effProxy := s.GetEffectiveUpstreamProxy()
+
+	targetHost := target
+	if _, _, err := net.SplitHostPort(targetHost); err != nil {
+		targetHost = net.JoinHostPort(strings.Trim(targetHost, "[]"), "443")
+	}
+
+	if tHost, tPort, splitErr := net.SplitHostPort(targetHost); splitErr == nil {
+		tHostTrimmed := strings.ToLower(strings.TrimRight(strings.Trim(tHost, "[]"), "."))
+		cfg := s.cfgMgr.Get()
+		listenPortStr := strconv.Itoa(cfg.ListenPort)
+		controlPortStr := strconv.Itoa(cfg.ControlPort)
+		localIP, localPort := safeLocalAddr(clientConn)
+		if localPort == "" {
+			localPort = listenPortStr
+		}
+		isSelfPort := tPort == listenPortStr || tPort == localPort || (controlPortStr != "" && tPort == controlPortStr)
+		isLANClient := isRemoteLANClientConn(clientConn)
+
+		// 1. Fast-path syntactic check (zero DNS cost)
+		isLiteralSelf := isLoopbackOrSelfHost(tHostTrimmed, localIP)
+		isLiteralLoopback := isLoopbackOrUnspecifiedHost(tHostTrimmed)
+		if (isLiteralSelf && isSelfPort) || (isLANClient && (isLiteralLoopback || isLiteralSelf)) {
+			writeHTTPResponse(clientConn, http.StatusForbidden, nil, nil, false, true)
+			return
+		}
+
+		// 2. Controlled DNS resolution for domain targets:
+		// Only resolve when required for security policy (specifically for self ports e.g. ControlPort or ListenPort).
+		// Normal request paths (e.g. port 443 / 80) must NOT have blocking DNS queries added.
+		var resolvedIPs []net.IP
+		if parsedIP := net.ParseIP(tHostTrimmed); parsedIP != nil {
+			resolvedIPs = []net.IP{parsedIP}
+		} else if isSelfPort {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ips, err := s.resolveHostIPs(ctx, tHostTrimmed)
+			cancel()
+			if err != nil {
+				writeHTTPResponse(clientConn, http.StatusBadGateway, nil, nil, false, true)
+				return
+			}
+			resolvedIPs = ips
+		}
+
+		// 3. Security policy check on all resolved IPs
+		if len(resolvedIPs) > 0 {
+			for _, ip := range resolvedIPs {
+				if isLoopbackOrSelfIP(ip, localIP) {
+					if isSelfPort || isLANClient {
+						writeHTTPResponse(clientConn, http.StatusForbidden, nil, nil, false, true)
+						return
+					}
+				}
+			}
+		}
+
+		var upConn net.Conn
+		var upReader io.Reader
+		var err error
+
+		if effProxy != "" {
+			if u, parseErr := url.Parse(effProxy); parseErr == nil {
+				scheme := strings.ToLower(u.Scheme)
+
+				if strings.HasPrefix(scheme, "socks") {
+					proxyHost := u.Hostname()
+					proxyPort := u.Port()
+					if proxyPort == "" {
+						proxyPort = "1080"
+					}
+					proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
+					user := ""
+					pass := ""
+					if u.User != nil {
+						user = u.User.Username()
+						pass, _ = u.User.Password()
+					}
+					upConn, err = dialSOCKS5(proxyAddr, targetHost, user, pass, 10*time.Second)
+				} else if scheme == "http" || scheme == "https" {
+					proxyHost := u.Hostname()
+					proxyPort := u.Port()
+					if proxyPort == "" {
+						if scheme == "https" {
+							proxyPort = "443"
+						} else {
+							proxyPort = "80"
+						}
+					}
+					proxyAddr := net.JoinHostPort(proxyHost, proxyPort)
+					dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					upConn, err = s.dialTarget(dialCtx, "tcp", proxyAddr)
+					dialCancel()
+					if err == nil && scheme == "https" {
+						cfg := s.cfgMgr.Get()
+						tlsCfg := &tls.Config{
+							ServerName:         proxyHost,
+							InsecureSkipVerify: !cfg.VerifyUpstreamTLS || cfg.ShimakazeMode,
+						}
+						tlsConn := tls.Client(upConn, tlsCfg)
+						_ = upConn.SetDeadline(time.Now().Add(10 * time.Second))
+						if hErr := tlsConn.Handshake(); hErr != nil {
+							_ = upConn.Close()
+							upConn = nil
+							err = hErr
+						} else {
+							_ = upConn.SetDeadline(time.Time{})
+							upConn = tlsConn
+						}
+					}
+					if err == nil && upConn != nil {
+						var authHeader string
+						if u.User != nil {
+							user := u.User.Username()
+							pass, _ := u.User.Password()
+							auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+							authHeader = fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
+						}
+						connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", targetHost, targetHost, authHeader)
+						_ = upConn.SetDeadline(time.Now().Add(10 * time.Second))
+						if _, wErr := upConn.Write([]byte(connectReq)); wErr != nil {
+							_ = upConn.Close()
+							upConn = nil
+							err = wErr
+						} else {
+							br := bufio.NewReader(upConn)
+							resp, rErr := http.ReadResponse(br, nil)
+							if rErr != nil || resp.StatusCode != http.StatusOK {
+								_ = upConn.Close()
+								upConn = nil
+								if rErr != nil {
+									err = rErr
+								} else {
+									err = fmt.Errorf("proxy returned %d", resp.StatusCode)
+								}
+							} else {
+								_ = upConn.SetDeadline(time.Time{})
+								upReader = br
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if upConn == nil && err == nil {
+			var dialAddrs []string
+			if len(resolvedIPs) > 0 {
+				for _, ip := range resolvedIPs {
+					if (isSelfPort || isLANClient) && isLoopbackOrSelfIP(ip, localIP) {
+						continue
+					}
+					dialAddrs = append(dialAddrs, net.JoinHostPort(ip.String(), tPort))
+				}
+			} else {
+				dialAddrs = []string{targetHost}
+			}
+
+			if len(dialAddrs) == 0 {
+				writeHTTPResponse(clientConn, http.StatusForbidden, nil, nil, false, true)
+				return
+			}
+
+			for _, dialAddr := range dialAddrs {
+				dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				c, dErr := s.dialTarget(dialCtx, "tcp", dialAddr)
+				dialCancel()
+				if dErr == nil && c != nil {
+					upConn = c
+					err = nil
+					break
+				}
+				err = dErr
+			}
+		}
+
+		if err != nil || upConn == nil {
+			writeHTTPResponse(clientConn, http.StatusBadGateway, nil, nil, false, true)
+			return
+		}
+		defer upConn.Close()
+
+		if upReader == nil {
+			upReader = upConn
+		}
+
+		if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+			return
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[BYPASS-TCP] Tunneling %s via upstream", targetHost))
+
+		var closeOnce sync.Once
+		closeBoth := func() {
+			closeOnce.Do(func() {
+				_ = clientConn.Close()
+				_ = upConn.Close()
+			})
+		}
+		defer closeBoth()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			defer closeBoth()
+			bufPtr := tunnelBufferPool.Get().(*[]byte)
+			defer tunnelBufferPool.Put(bufPtr)
+			_, _ = io.CopyBuffer(clientConn, upReader, *bufPtr)
+		}()
+
+		go func() {
+			defer wg.Done()
+			defer closeBoth()
+			bufPtr := tunnelBufferPool.Get().(*[]byte)
+			defer tunnelBufferPool.Put(bufPtr)
+			_, _ = io.CopyBuffer(upConn, clientReader, *bufPtr)
+		}()
+
+		wg.Wait()
+		return
+	}
+
+	writeHTTPResponse(clientConn, http.StatusBadRequest, nil, nil, false, true)
+}
+
+func isPrivateProxyHost(host string) bool {
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.To4() != nil && ip.IsPrivate()
+}
+
+func isLoopbackOrUnspecifiedHost(hostTrimmed string) bool {
+	if hostTrimmed == "" || hostTrimmed == "127.0.0.1" || hostTrimmed == "localhost" ||
+		hostTrimmed == "::1" || hostTrimmed == "0.0.0.0" || hostTrimmed == "::" {
+		return true
+	}
+	if ip := net.ParseIP(hostTrimmed); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return true
+	}
+	return false
+}
+
+func isLoopbackOrSelfIP(ip net.IP, localIP string) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 127 { // 127.0.0.0/8 loopback range
+			return true
+		}
+	}
+	if localIP != "" {
+		if lip := net.ParseIP(localIP); lip != nil && lip.Equal(ip) {
+			return true
+		}
+	}
+	if lanIP := config.GetLANIP(); lanIP != "" {
+		if lip := net.ParseIP(lanIP); lip != nil && lip.Equal(ip) {
+			return true
+		}
+	}
+	// Check against local interface addresses
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if addrs, err := iface.Addrs(); err == nil {
+				for _, addr := range addrs {
+					var ifIP net.IP
+					switch v := addr.(type) {
+					case *net.IPNet:
+						ifIP = v.IP
+					case *net.IPAddr:
+						ifIP = v.IP
+					}
+					if ifIP != nil && ifIP.Equal(ip) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func extractEmbeddedIP(host string) net.IP {
+	host = strings.ToLower(strings.TrimRight(strings.Trim(host, "[]"), "."))
+	if strings.HasSuffix(host, "localtest.me") || strings.HasSuffix(host, "lvh.me") {
+		return net.ParseIP("127.0.0.1")
+	}
+	if !strings.HasSuffix(host, ".nip.io") &&
+		!strings.HasSuffix(host, ".sslip.io") &&
+		!strings.HasSuffix(host, ".traefik.me") {
+		return nil
+	}
+	parts := strings.Split(host, ".")
+	for i := 0; i <= len(parts)-4; i++ {
+		candidate := strings.Join(parts[i:i+4], ".")
+		if ip := net.ParseIP(candidate); ip != nil {
+			return ip
+		}
+	}
+	for _, part := range parts {
+		if ip := net.ParseIP(part); ip != nil {
+			return ip
+		}
+		if strings.Contains(part, "-") {
+			dotted := strings.ReplaceAll(part, "-", ".")
+			if ip := net.ParseIP(dotted); ip != nil {
+				return ip
+			}
+			coloned := strings.ReplaceAll(part, "-", ":")
+			if ip := net.ParseIP(coloned); ip != nil {
+				return ip
+			}
+		}
+	}
+	return nil
+}
+
+func isLoopbackOrSelfHost(hostTrimmed, localIP string) bool {
+	if isLoopbackOrUnspecifiedHost(hostTrimmed) || hostTrimmed == "proxy" || hostTrimmed == "gbf-proxy" {
+		return true
+	}
+	if localIP != "" && strings.EqualFold(hostTrimmed, localIP) {
+		return true
+	}
+	if lanIP := config.GetLANIP(); lanIP != "" && strings.EqualFold(hostTrimmed, lanIP) {
+		return true
+	}
+	if ip := net.ParseIP(hostTrimmed); ip != nil {
+		return isLoopbackOrSelfIP(ip, localIP)
+	}
+	if embIP := extractEmbeddedIP(hostTrimmed); embIP != nil {
+		return isLoopbackOrSelfIP(embIP, localIP)
+	}
+	return false
+}
+
+func isRemoteLANClientConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	rAddr := conn.RemoteAddr()
+	if rAddr == nil {
+		return false
+	}
+	if tcpAddr, ok := rAddr.(*net.TCPAddr); ok && tcpAddr != nil && tcpAddr.IP != nil {
+		return !tcpAddr.IP.IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(rAddr.String())
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && !ip.IsLoopback()
+}
+
+func safeLocalAddr(conn net.Conn) (localIP string, localPort string) {
+	if conn == nil {
+		return "", ""
+	}
+	defer func() {
+		_ = recover()
+	}()
+	if la := conn.LocalAddr(); la != nil {
+		if tcpAddr, ok := la.(*net.TCPAddr); ok && tcpAddr != nil {
+			return tcpAddr.IP.String(), strconv.Itoa(tcpAddr.Port)
+		}
+		if h, p, err := net.SplitHostPort(la.String()); err == nil {
+			return strings.Trim(h, "[]"), p
+		}
+	}
+	return "", ""
+}
+
+func extractActualTarget(req *http.Request) (string, string) {
+	raw := ""
+	if req.URL != nil && req.URL.Host != "" {
+		raw = req.URL.Host
+	} else if strings.HasPrefix(req.RequestURI, "http://") || strings.HasPrefix(req.RequestURI, "https://") || strings.HasPrefix(req.RequestURI, "//") {
+		if u, err := url.Parse(req.RequestURI); err == nil && u.Host != "" {
+			raw = u.Host
+		}
+	}
+	if raw == "" {
+		raw = req.Host
+	}
+	// Strip userinfo if present in authority (e.g. user:pass@host:port -> host:port)
+	if atIdx := strings.LastIndex(raw, "@"); atIdx != -1 {
+		raw = raw[atIdx+1:]
+	}
+	if strings.IndexByte(raw, ':') != -1 {
+		if h, p, err := net.SplitHostPort(raw); err == nil {
+			return strings.ToLower(strings.TrimRight(strings.Trim(h, "[]"), ".")), p
+		}
+	}
+	return strings.ToLower(strings.TrimRight(strings.Trim(raw, "[]"), ".")), ""
+}
+
+func (s *ProxyServer) handlePlainHTTP(conn net.Conn, req *http.Request) bool {
+	hostTrimmed, reqPort := extractActualTarget(req)
+	cleanPath := strings.ToLower(strings.Split(req.URL.Path, "?")[0])
+
+	// Check if this request targets local internal proxy endpoints
+	cfg := s.cfgMgr.Get()
+	listenPortStr := strconv.Itoa(cfg.ListenPort)
+	controlPortStr := strconv.Itoa(cfg.ControlPort)
+	localIP, localPort := safeLocalAddr(conn)
+	if localPort == "" {
+		localPort = listenPortStr
+	}
+
+	effectivePort := reqPort
+	if effectivePort == "" {
+		if req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") {
+			effectivePort = "443"
+		} else {
+			effectivePort = "80"
+		}
+	}
+
+	isProxyPort := reqPort == listenPortStr || reqPort == localPort || effectivePort == listenPortStr || effectivePort == localPort
+	isControlPort := controlPortStr != "" && effectivePort == controlPortStr
+	isSelfHost := isLoopbackOrSelfHost(hostTrimmed, localIP)
+
+	// Local control plane isolation: strictly reject proxy requests targeting the local control port.
+	if isControlPort {
+		if isSelfHost {
+			writeHTTPResponse(conn, http.StatusForbidden, nil, nil, req.Method == http.MethodHead, true)
+			return false
+		}
+		if net.ParseIP(hostTrimmed) == nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			if ips, err := s.resolveHostIPs(ctx, hostTrimmed); err == nil {
+				for _, ip := range ips {
+					if isLoopbackOrSelfIP(ip, localIP) {
+						cancel()
+						writeHTTPResponse(conn, http.StatusForbidden, nil, nil, req.Method == http.MethodHead, true)
+						return false
+					}
+				}
+			}
+			cancel()
+		}
+	}
+
+	isInternalCertOrPac := (cleanPath == "/ca.crt" || cleanPath == "/ca.pem" ||
+		cleanPath == "/proxy.pac" ||
+		strings.HasSuffix(cleanPath, "/ca.crt") || strings.HasSuffix(cleanPath, "/proxy.pac")) && (!req.URL.IsAbs() || isProxyPort)
+	isLandingPage := cleanPath == "" || cleanPath == "/" || cleanPath == "/index.html"
+
+	isLocalHost := hostTrimmed == "" || hostTrimmed == "127.0.0.1" || hostTrimmed == "localhost" ||
+		hostTrimmed == "::1" || hostTrimmed == "proxy" || hostTrimmed == "gbf-proxy" ||
+		(localIP != "" && strings.EqualFold(hostTrimmed, localIP)) ||
+		(config.GetLANIP() != "" && strings.EqualFold(hostTrimmed, config.GetLANIP()))
+
+	// A proxy client may address the listener using any of the machine's private
+	// LAN addresses (important on multi-NIC hosts). The proxy port is the anchor:
+	// public/external hosts are never treated as internal, while RFC1918 addresses
+	// on this listener can use the local helper endpoints.
+	isProxyEndpointHost := isLocalHost || (isProxyPort && isPrivateProxyHost(hostTrimmed))
+	isDirectLocal := false
+	if isProxyEndpointHost {
+		if isInternalCertOrPac {
+			isDirectLocal = true
+		} else if isLandingPage {
+			isDirectLocal = !req.URL.IsAbs() || isProxyPort
+		}
+	}
+
+	// 1. Root CA Certificate download (only for direct requests to proxy host itself)
+	if isDirectLocal && (cleanPath == "/ca.crt" || cleanPath == "/ca.pem" || strings.HasSuffix(cleanPath, "/ca.crt")) {
+		caBytes := s.certMgr.GetCAPEM()
+		hdr := make(http.Header)
+		hdr.Set("Content-Type", "application/x-x509-ca-cert")
+		hdr.Set("Content-Disposition", `attachment; filename="gbf_ca.crt"`)
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Set("Cache-Control", "no-cache")
+		writeHTTPResponse(conn, http.StatusOK, hdr, caBytes, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+
+	// 2. Dynamic PAC script (only for direct requests to proxy host itself)
+	if isDirectLocal && (cleanPath == "/proxy.pac" || strings.HasSuffix(cleanPath, "/proxy.pac")) {
+		cfg := s.cfgMgr.Get()
+		h := "127.0.0.1"
+		if hostTrimmed != "" && hostTrimmed != "127.0.0.1" && hostTrimmed != "localhost" && hostTrimmed != "::1" {
+			h = hostTrimmed
+		}
+		pacText := GetPAC(h, cfg.ListenPort)
+		hdr := make(http.Header)
+		hdr.Set("Content-Type", "application/x-ns-proxy-autoconfig")
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		hdr.Set("Pragma", "no-cache")
+		hdr.Set("Expires", "0")
+		writeHTTPResponse(conn, http.StatusOK, hdr, []byte(pacText), req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+
+	// 3. Mobile LAN landing guide (only for direct requests to proxy host itself)
+	if isDirectLocal && (cleanPath == "" || cleanPath == "/" || cleanPath == "/index.html") {
+		cfg := s.cfgMgr.Get()
+		lanIP := config.GetLANIP()
+		if hostTrimmed != "127.0.0.1" && hostTrimmed != "localhost" && hostTrimmed != "::1" && hostTrimmed != "" && !isExternalGBFDomain(hostTrimmed) {
+			lanIP = hostTrimmed
+		} else if lanIP == "" {
+			lanIP = "127.0.0.1"
+		}
+		html := GetLandingHTML(lanIP, cfg.ListenPort)
+		hdr := make(http.Header)
+		hdr.Set("Content-Type", "text/html; charset=utf-8")
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		writeHTTPResponse(conn, http.StatusOK, hdr, []byte(html), req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+
+	// 4. Plain HTTP proxy request (e.g. GET http://gbf.game.mbga.jp/)
+	if isGBFDomain(hostTrimmed) && isStaticTarget(hostTrimmed, req.URL.Path) && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+		return s.handleStaticAsset(conn, req, hostTrimmed)
+	}
+	return s.forwardPlainProxy(conn, req)
+}
+
+func (s *ProxyServer) forwardPlainProxy(conn net.Conn, req *http.Request) bool {
+	s.stats.IncAPI()
+	s.stats.AddActiveAPI(1)
+	defer s.stats.AddActiveAPI(-1)
+
+	// Loop prevention: do not forward requests targeted at the proxy itself
+	hostTrimmed, reqPort := extractActualTarget(req)
+	effectivePort := reqPort
+	if effectivePort == "" {
+		if req.URL != nil && strings.EqualFold(req.URL.Scheme, "https") {
+			effectivePort = "443"
+		} else {
+			effectivePort = "80"
+		}
+	}
+
+	cfg := s.cfgMgr.Get()
+	listenPortStr := strconv.Itoa(cfg.ListenPort)
+	controlPortStr := strconv.Itoa(cfg.ControlPort)
+	localIP, localPort := safeLocalAddr(conn)
+	if localPort == "" {
+		localPort = listenPortStr
+	}
+
+	isProxyPort := effectivePort == listenPortStr || effectivePort == localPort
+	isControlPort := controlPortStr != "" && effectivePort == controlPortStr
+	isSelfHost := isLoopbackOrSelfHost(hostTrimmed, localIP)
+
+	if isProxyPort && isSelfHost {
+		writeHTTPResponse(conn, http.StatusNotFound, nil, nil, req.Method == http.MethodHead, true)
+		return false
+	}
+	if isControlPort {
+		if isSelfHost {
+			writeHTTPResponse(conn, http.StatusForbidden, nil, nil, req.Method == http.MethodHead, true)
+			return false
+		}
+		if net.ParseIP(hostTrimmed) == nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			if ips, err := s.resolveHostIPs(ctx, hostTrimmed); err == nil {
+				for _, ip := range ips {
+					if isLoopbackOrSelfIP(ip, localIP) {
+						cancel()
+						writeHTTPResponse(conn, http.StatusForbidden, nil, nil, req.Method == http.MethodHead, true)
+						return false
+					}
+				}
+			}
+			cancel()
+		}
+	}
+	if isRemoteLANClientConn(conn) {
+		if isLoopbackOrUnspecifiedHost(hostTrimmed) || isSelfHost {
+			writeHTTPResponse(conn, http.StatusForbidden, nil, nil, req.Method == http.MethodHead, true)
+			return false
+		}
+	}
+
+	startTime := time.Now()
+	upURL := req.URL.String()
+	targetHost := hostTrimmed
+	if reqPort != "" && reqPort != "80" && reqPort != "443" {
+		targetHost = net.JoinHostPort(targetHost, reqPort)
+	} else if strings.Contains(targetHost, ":") && !strings.HasPrefix(targetHost, "[") {
+		targetHost = "[" + targetHost + "]"
+	}
+	if targetHost == "" {
+		targetHost = "gbf.game.mbga.jp"
+	}
+	if !strings.HasPrefix(upURL, "http://") && !strings.HasPrefix(upURL, "https://") {
+		upURL = "http://" + targetHost + req.URL.RequestURI()
+	}
+
+	var bodyBytes []byte
+	if req.Body != nil {
+		var bodyErr error
+		bodyBytes, bodyErr = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if bodyErr != nil {
+			writeHTTPResponse(conn, http.StatusBadRequest, nil, nil, req.Method == http.MethodHead, req.Close)
+			return !req.Close
+		}
+	}
+	cleanPath := strings.ToLower(strings.Split(req.URL.Path, "?")[0])
+
+	// Strict P0 Safe Retry Rule:
+	// Only read-only idempotent GET requests to whitelisted paths may be retried on connection drop.
+	// All POST/PUT/DELETE requests have maxAttempts = 1 (strictly zero retry).
+	isGet := (req.Method == http.MethodGet || req.Method == http.MethodHead)
+	isRetryable := (isGet && isRetryableAPI(cleanPath))
+	maxAttempts := 1
+	if isRetryable {
+		maxAttempts = 2
+	}
+
+	var resp *http.Response
+	var respBytes []byte
+	var fetchErr error
+	var reqReused bool
+	var apiClient *http.Client
+	var route failoverRoute
+	var trial bool
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		upReq, err := newUpstreamAPIRequest(req.Context(), req, upURL, bodyBytes)
+		if err != nil {
+			fetchErr = err
+			break
+		}
+
+		for k, vv := range req.Header {
+			if isHopByHop(k) {
+				continue
+			}
+			for _, v := range vv {
+				upReq.Header.Add(k, v)
+			}
+		}
+		// RFC 9112 §3.2.2:
+		// "When a proxy receives a request with an absolute-form request-target,
+		// the proxy MUST ignore the received Host header field (if any) and instead
+		// use the host information from the request-target. A proxy forwarding such
+		// a request MUST generate a new Host field-value based on the received
+		// request-target rather than forward the received Host field-value."
+		if req.URL != nil && req.URL.Host != "" {
+			upReq.Host = targetHost
+			upReq.Header.Del("Host")
+		} else if req.Host != "" {
+			upReq.Host = req.Host
+		} else {
+			upReq.Host = targetHost
+		}
+
+		if attempt == 0 {
+			apiClient, route, trial = s.getAPIClientForRequest(req.Method)
+		} else {
+			trial = false
+		}
+
+		var tracker *inFlightTracker
+		if isGet {
+			tracker = s.startInFlightWatch(route, trial)
+		}
+		tracedReq, cancelAttempt := s.prepareAPIRequestTrace(upReq, func(reused bool) {
+			reqReused = reused
+		})
+		attemptStart := time.Now()
+		resp, fetchErr = apiClient.Do(tracedReq)
+
+		if fetchErr != nil || resp == nil {
+			lastAttemptElapsed := time.Since(attemptStart)
+			tracker.stop()
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			resp = nil
+			cancelAttempt(nil)
+			obsErr := fetchErr
+			if obsErr == nil {
+				obsErr = errors.New("upstream returned nil response")
+			}
+			if isGet {
+				s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, obsErr)
+			}
+			if attempt+1 < maxAttempts && isConnectionDropError(fetchErr) {
+				s.stats.IncAPIRetry()
+				continue
+			}
+			break
+		}
+
+		var readErr error
+		respBytes, readErr = io.ReadAll(resp.Body)
+		lastAttemptElapsed := time.Since(attemptStart)
+		tracker.stop()
+		_ = resp.Body.Close()
+		cancelAttempt(nil)
+		if readErr != nil {
+			if isGet {
+				s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, readErr)
+			}
+			fetchErr = readErr
+			resp = nil
+			break
+		}
+
+		var obsErr error
+		if trial && resp.StatusCode >= http.StatusInternalServerError {
+			obsErr = fmt.Errorf("upstream trial returned %d", resp.StatusCode)
+		}
+		if isGet {
+			s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, obsErr)
+		}
+		break
+	}
+	if fetchErr != nil || resp == nil {
+		writeHTTPResponse(conn, http.StatusBadGateway, nil, nil, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+	s.forwardDynamicResponse(conn, resp, respBytes, req.Method == http.MethodHead, req.Close)
+	if s.prefetch != nil && resp != nil && resp.StatusCode == http.StatusOK && len(respBytes) > 0 {
+		prefetchHost := hostTrimmed
+		if prefetchHost == "" {
+			prefetchHost = req.Host
+		}
+		s.prefetch.MaybeEnqueueGameData(req, prefetchHost, respBytes)
+	}
+	elapsed := time.Since(startTime).Milliseconds()
+	if s.telemetryEnabled() {
+		s.stats.RecordProtocol(resp.Proto)
+		s.stats.RecordLatency(float64(elapsed))
+	}
+	reusedStr := "new"
+	if reqReused {
+		reusedStr = "reused"
+	}
+	protoStr := resp.Proto
+	if protoStr == "" {
+		protoStr = "HTTP/1.1"
+	}
+	uri := req.URL.RequestURI()
+	if !strings.HasPrefix(uri, "/") {
+		uri = "/" + uri
+	}
+	s.stats.Log("INFO", fmt.Sprintf("[BYPASS-PLAIN-API] %d %s %s (%dms, %s, %s)", resp.StatusCode, req.Method, uri, elapsed, protoStr, reusedStr))
+	return !req.Close
+}
+
+func (s *ProxyServer) handleDecryptedRequest(w io.Writer, req *http.Request, targetHost string) bool {
+	// Static Asset vs Dynamic Game API
+	pathLower := strings.ToLower(req.URL.Path)
+	isStatic := (req.Method == http.MethodGet || req.Method == http.MethodHead) && isStaticTargetLower(targetHost, pathLower)
+	if isStatic {
+		return s.handleStaticAssetLower(w, req, targetHost, pathLower)
+	}
+
+	return s.handleDynamicAPI(w, req, targetHost)
+}
+
+func isBlockedWindowsPath(s string) bool {
+	return isBlockedWindowsPathLower(strings.ToLower(s))
+}
+
+func isBlockedWindowsPathLower(s string) bool {
+	if strings.HasPrefix(s, "windows/") || strings.HasPrefix(s, "windows\\") ||
+		s == "windows" ||
+		strings.HasPrefix(s, "/windows/") || strings.HasPrefix(s, `\windows\`) ||
+		strings.HasPrefix(s, "/windows\\") || strings.HasPrefix(s, `\windows/`) ||
+		s == "/windows" || s == `\windows` ||
+		strings.Contains(s, "/windows/") || strings.Contains(s, `\windows\`) ||
+		strings.Contains(s, "/windows\\") || strings.Contains(s, `\windows/`) ||
+		strings.HasSuffix(s, "/windows") || strings.HasSuffix(s, `\windows`) {
+		return true
+	}
+	if len(s) >= 2 && s[1] == ':' && (s[0] >= 'a' && s[0] <= 'z') {
+		rest := s[2:]
+		if rest == `\windows` || rest == `/windows` ||
+			strings.HasPrefix(rest, `\windows\`) || strings.HasPrefix(rest, `/windows/`) ||
+			strings.HasPrefix(rest, `\windows/`) || strings.HasPrefix(rest, `/windows\\`) {
+			return true
+		}
+	}
+	return false
+}
+
+func isVersionedAssetPath(p string) bool {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '/' {
+			continue
+		}
+		sub := p[i:]
+		var rest string
+		if strings.HasPrefix(sub, "/assets/") {
+			rest = sub[8:]
+		} else if strings.HasPrefix(sub, "/assets_en/") {
+			rest = sub[11:]
+		} else if strings.HasPrefix(sub, "/assets_jp/") {
+			rest = sub[11:]
+		}
+
+		if rest != "" {
+			slashIdx := strings.IndexByte(rest, '/')
+			if slashIdx > 0 {
+				allDigits := true
+				for k := 0; k < slashIdx; k++ {
+					if rest[k] < '0' || rest[k] > '9' {
+						allDigits = false
+						break
+					}
+				}
+				if allDigits {
+					return true
+				}
+			}
+		}
+
+		start := i + 1
+		end := start
+		for end < len(p) && p[end] >= '0' && p[end] <= '9' {
+			end++
+		}
+		if (end-start) >= 8 && end < len(p) && p[end] == '/' {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ProxyServer) getCacheControlHeader(urlPath string) string {
+	cfg := s.cfgMgr.Get()
+	if !cfg.EnableBrowserCache {
+		return "no-cache"
+	} else if isVersionedAssetPath(urlPath) {
+		return "public, max-age=31536000, immutable"
+	}
+	return "public, max-age=3600"
+}
+
+func isClientNotModified(req *http.Request, item *cache.CacheItem) bool {
+	if item == nil {
+		return false
+	}
+	reqETag := req.Header.Get("If-None-Match")
+	if reqETag != "" {
+		return matchETag(reqETag, item.ETag)
+	}
+	reqIMS := req.Header.Get("If-Modified-Since")
+	if reqIMS != "" && item.LastModified != "" {
+		if reqIMS == item.LastModified {
+			return true
+		}
+		tIMS, err1 := http.ParseTime(reqIMS)
+		tLM, err2 := http.ParseTime(item.LastModified)
+		if err1 == nil && err2 == nil {
+			return !tLM.After(tIMS)
+		}
+	}
+	return false
+}
+
+func isConditionalRequest(req *http.Request) bool {
+	return req.Header.Get("If-None-Match") != "" || req.Header.Get("If-Modified-Since") != ""
+}
+
+func (s *ProxyServer) sendNotModifiedResponse(w io.Writer, item *cache.CacheItem, urlPath string, reqClose bool) {
+	hdr := make(http.Header)
+	if item.ETag != "" {
+		hdr.Set("ETag", item.ETag)
+	}
+	if item.LastModified != "" {
+		hdr.Set("Last-Modified", item.LastModified)
+	}
+	hdr.Set("Cache-Control", s.getCacheControlHeader(urlPath))
+	hdr.Set("Access-Control-Allow-Origin", "*")
+
+	writeHTTPResponse(w, http.StatusNotModified, hdr, nil, false, reqClose)
+}
+
+func (s *ProxyServer) handleStaticAsset(w io.Writer, req *http.Request, targetHost string) bool {
+	return s.handleStaticAssetLower(w, req, targetHost, strings.ToLower(req.URL.Path))
+}
+
+func (s *ProxyServer) handleStaticAssetLower(w io.Writer, req *http.Request, targetHost, pathLower string) bool {
+	cleanPath, _, _ := strings.Cut(req.URL.Path, "?")
+
+	// Security: Reject path traversal sequences immediately
+	// Extract the path portion from raw req.RequestURI before unescaping
+	// (so that query parameters like ?t=12:34:56 do not falsely trigger colon checks,
+	// and encoded %3F in path is not confused with query delimiter).
+	rawURIPath, _, _ := strings.Cut(req.RequestURI, "?")
+	rawURIPath, _, _ = strings.Cut(rawURIPath, "#")
+
+	if idx := strings.Index(rawURIPath, "://"); idx != -1 {
+		afterScheme := rawURIPath[idx+3:]
+		if slashIdx := strings.Index(afterScheme, "/"); slashIdx != -1 {
+			rawURIPath = afterScheme[slashIdx:]
+		} else {
+			rawURIPath = "/"
+		}
+	} else if strings.HasPrefix(rawURIPath, "//") {
+		afterSlashes := strings.TrimPrefix(rawURIPath, "//")
+		if slashIdx := strings.Index(afterSlashes, "/"); slashIdx != -1 {
+			rawURIPath = afterSlashes[slashIdx:]
+		} else {
+			rawURIPath = "/"
+		}
+	}
+
+	unescapedPath, _ := url.PathUnescape(rawURIPath)
+	unescapedURI, _ := url.PathUnescape(req.RequestURI)
+
+	thHost := targetHost
+	thHostHasColon := false
+	if strings.IndexByte(targetHost, ':') != -1 {
+		if hp, port, err := net.SplitHostPort(targetHost); err == nil {
+			thHost = hp
+			if _, pErr := strconv.Atoi(port); pErr != nil {
+				thHostHasColon = true
+			}
+			if port == "80" || port == "443" {
+				targetHost = hp
+			}
+		}
+	}
+	thHost = strings.Trim(thHost, "[]")
+	if strings.Contains(thHost, ":") && net.ParseIP(thHost) == nil {
+		thHostHasColon = true
+	}
+
+	unescapedLower := strings.ToLower(unescapedURI)
+	unescapedPathLower := strings.ToLower(unescapedPath)
+	reqURILower := strings.ToLower(req.RequestURI)
+	cleanLower := pathLower
+	if cleanPath != req.URL.Path {
+		cleanLower = strings.ToLower(cleanPath)
+	}
+	if strings.Contains(req.RequestURI, "..") ||
+		strings.Contains(req.URL.Path, "..") ||
+		strings.Contains(unescapedURI, "..") ||
+		isBlockedWindowsPathLower(reqURILower) ||
+		isBlockedWindowsPathLower(pathLower) ||
+		isBlockedWindowsPathLower(unescapedLower) ||
+		isBlockedWindowsPathLower(unescapedPathLower) ||
+		strings.Contains(reqURILower, "passwd") ||
+		strings.Contains(pathLower, "passwd") ||
+		strings.Contains(unescapedLower, "passwd") ||
+		strings.Contains(cleanPath, ":") ||
+		strings.Contains(unescapedPath, ":") ||
+		thHostHasColon ||
+		strings.HasPrefix(cleanLower, "\\") ||
+		strings.HasPrefix(unescapedLower, "\\") ||
+		strings.HasPrefix(unescapedPathLower, "\\") {
+		writeHTTPResponse(w, http.StatusBadRequest, nil, nil, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+
+	s.stats.IncAsset()
+	s.stats.AddActiveFG(1)
+	defer s.stats.AddActiveFG(-1)
+
+	isHead := (req.Method == http.MethodHead)
+	isCond := isConditionalRequest(req)
+	ns, _ := NormalizeAssetNamespace(targetHost)
+	if s.prefetch != nil {
+		if isGBFAkamaiHost(targetHost) {
+			s.prefetch.RecordActiveGBFHost(targetHost)
+		}
+		if strings.HasPrefix(pathLower, "/assets_en/") {
+			s.prefetch.RecordActiveLangPrefix("/assets_en")
+		} else if strings.HasPrefix(pathLower, "/assets/") {
+			s.prefetch.RecordActiveLangPrefix("/assets")
+		}
+	}
+
+	return s.serveStaticAssetCore(w, req, targetHost, ns, cleanPath, isHead, isCond, true)
+}
+
+func (s *ProxyServer) serveStaticAssetCore(w io.Writer, req *http.Request, targetHost, ns, cleanPath string, isHead, isCond, allowRetry bool) bool {
+	// 1. Cache Lookup (RAM first, then SSD)
+	cacheStart := time.Now()
+	rangeHdr := strings.TrimSpace(req.Header.Get("Range"))
+	// RFC 9110: A server MUST ignore a Range header field received with a request method other than GET.
+	hasRange := rangeHdr != "" && !isHead && req.Method == http.MethodGet
+
+	var item *cache.CacheItem
+	var hitSrc string
+
+	if isHead || isCond || hasRange {
+		// HEAD / conditional / Range request uses metadata-first lookup without reading whole disk file into RAM
+		item, hitSrc = s.cacheMgr.VerifyAndGetMetadataWithNamespace(ns, req.URL.Path)
+	} else {
+		// Standard GET: directly call GetWithNamespace() to preserve zero extra Stat/lookup for <=2MB items
+		item, hitSrc = s.cacheMgr.GetWithNamespace(ns, req.URL.Path)
+	}
+
+	maxRAMItemSize := s.cacheMgr.MaxRAMItemSize()
+	if maxRAMItemSize <= 0 {
+		maxRAMItemSize = 16 * 1024 * 1024
+	}
+
+	if item != nil {
+		s.stats.CheckAndRecordPrefetchReused(cleanPath)
+		if hitSrc == "RAM" || hitSrc == "RAM-BOOST" {
+			s.stats.IncRAMHit()
+			// P2: Hot path optimization: lightweight atomic counters only for RAM hits
+		} else {
+			s.stats.IncDiskHit()
+			s.stats.Log("INFO", fmt.Sprintf("[CACHE-DISK] HIT %dms -> %s (%d B)", time.Since(cacheStart).Milliseconds(), cleanPath, item.Size))
+		}
+
+		// Conditional GET: 304 Not Modified check (0 字节缓存正文读取；仅访问必要的文件元数据/.ext)
+		if isClientNotModified(req, item) {
+			s.stats.Log("INFO", fmt.Sprintf("[%s] 304 %dms Not Modified -> %s", "CACHE-"+hitSrc, time.Since(cacheStart).Milliseconds(), cleanPath))
+			s.sendNotModifiedResponse(w, item, req.URL.Path, req.Close)
+			return !req.Close
+		}
+
+		if hasRange && isIfRangeMatched(req.Header.Get("If-Range"), item) {
+			if item.ContentEncoding != "" {
+				return s.handleStaticRangeFromUpstream(w, req, targetHost, ns, cleanPath, isHead)
+			}
+			totalSize := item.Size
+			if len(item.Data) > 0 {
+				totalSize = int64(len(item.Data))
+			}
+			start, end, rangeStatus := parseSingleByteRange(rangeHdr, totalSize)
+			switch rangeStatus {
+			case http.StatusPartialContent:
+				if isHead || item.Data != nil {
+					s.sendCachedRangeResponse(w, item, start, end, totalSize, isHead, req.URL.Path, req.Close)
+					return !req.Close
+				}
+				if ok, keepAlive := s.serveDiskRangeResponse(w, req, ns, item, start, end, totalSize); ok {
+					return keepAlive
+				}
+				s.cacheMgr.Invalidate(ns, req.URL.Path)
+				s.stats.DiskHits.Add(-1)
+				return s.handleStaticRangeFromUpstream(w, req, targetHost, ns, cleanPath, isHead)
+			case http.StatusRequestedRangeNotSatisfiable:
+				s.sendRangeNotSatisfiableResponse(w, item, totalSize, isHead, req.URL.Path, req.Close)
+				return !req.Close
+			case 0:
+				return s.handleStaticRangeFromUpstream(w, req, targetHost, ns, cleanPath, isHead)
+			}
+		}
+
+		// HEAD request: serialize headers fast, zero body written (0 字节缓存正文读取；仅访问必要的文件元数据/.ext)
+		if isHead {
+			s.sendCachedAssetResponseFast(w, item, true, req.URL.Path, req.Close)
+			return !req.Close
+		}
+
+		if item.Data != nil {
+			// GET request: body is loaded (RAM hit or loaded disk item), send fast
+			s.sendCachedAssetResponseFast(w, item, false, req.URL.Path, req.Close)
+			return !req.Close
+		}
+
+		// If Data was not loaded (e.g. conditional GET or ignored/mismatched Range evaluated with VerifyAndGetMetadataWithNamespace),
+		// load into memory if within RAM item limit, or stream directly from disk for large files.
+		if item.Size <= maxRAMItemSize {
+			if fullItem, _ := s.cacheMgr.GetWithNamespace(ns, req.URL.Path); fullItem != nil && fullItem.Data != nil {
+				s.sendCachedAssetResponseFast(w, fullItem, false, req.URL.Path, req.Close)
+				return !req.Close
+			}
+		} else {
+			if ok, keepAlive := s.streamCachedDiskItemToClient(w, req, ns, item); ok {
+				return keepAlive
+			}
+		}
+		s.cacheMgr.Invalidate(ns, req.URL.Path)
+		s.stats.DiskHits.Add(-1)
+		s.stats.Log("WARN", fmt.Sprintf("[CACHE-DISK] read failed for %s, falling back to cache miss", cleanPath))
+	}
+
+	// 2. Cache Miss: Coalesce concurrent fetches using SingleFlight with normalized key
+	if allowRetry {
+		s.stats.IncMiss()
+	}
+	if hasRange {
+		return s.handleStaticRangeFromUpstream(w, req, targetHost, ns, cleanPath, isHead)
+	}
+
+	flightKey := ns + ":" + cleanPath
+
+	// If request is HEAD, check if an existing GET request is ALREADY in-flight for this asset.
+	// If a GET leader is actively streaming, HEAD coalesces as a follower to reuse the result.
+	// Otherwise (cold cache miss without an active GET leader), HEAD takes the dedicated lightweight
+	// head-miss path to read 0 body bytes and avoid full payload download.
+	if isHead && !s.cacheMgr.SingleFlight().IsInFlight(flightKey) {
+		return s.handleStaticAssetHeadMiss(w, req, targetHost, ns, cleanPath, isCond)
+	}
+
+	reqCtx := req.Context()
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+
+	var leaderStreamed bool
+	var clientWriteFailed bool
+
+	if s.beforeSingleFlightDoContext != nil {
+		s.beforeSingleFlightDoContext(flightKey, isHead)
+	}
+
+	res, err := s.cacheMgr.SingleFlight().DoContext(reqCtx, flightKey, func() (interface{}, error) {
+		if isHead {
+			if s.insideSingleFlightHeadHook != nil {
+				s.insideSingleFlightHeadHook(flightKey)
+			}
+			return nil, errHeadCannotBeGetLeader
+		}
+		upURL := fmt.Sprintf("https://%s%s", targetHost, req.URL.RequestURI())
+		upReq, err := http.NewRequestWithContext(context.Background(), "GET", upURL, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for k, vv := range req.Header {
+			if isHopByHop(k) || strings.EqualFold(k, "if-none-match") || strings.EqualFold(k, "if-modified-since") || strings.EqualFold(k, "range") || strings.EqualFold(k, "if-range") {
+				continue
+			}
+			for _, v := range vv {
+				upReq.Header.Add(k, v)
+			}
+		}
+		upReq.Host = targetHost
+
+		assetClient, route, trial := s.getAssetClientForRequest(req.Method)
+		tracker := s.startInFlightWatch(route, trial)
+		fetchStart := time.Now()
+		resp, err := assetClient.Do(s.tracedRequest(upReq))
+		headerElapsed := time.Since(fetchStart)
+		if err == nil && resp != nil && s.telemetryEnabled() {
+			s.stats.RecordProtocol(resp.Proto)
+			s.stats.RecordLatency(float64(headerElapsed.Milliseconds()))
+		}
+		var finishOnce sync.Once
+		finishUpstream := func(uErr error, elapsed time.Duration) {
+			finishOnce.Do(func() {
+				s.finishInFlightWatch(tracker, route, trial, elapsed, uErr)
+			})
+		}
+		defer func() {
+			finishUpstream(err, time.Since(fetchStart))
+		}()
+		if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+			obsErr := err
+			if obsErr == nil {
+				if resp == nil {
+					obsErr = errors.New("upstream returned nil response")
+				} else if trial || resp.StatusCode >= http.StatusInternalServerError {
+					obsErr = fmt.Errorf("upstream returned %d", resp.StatusCode)
+				}
+			}
+			finishUpstream(obsErr, headerElapsed)
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			// Check offline cache fallback
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return fb, nil
+			}
+			if err != nil {
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: %v", cleanPath, err))
+				return nil, err
+			}
+			if resp == nil {
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: upstream returned nil response", cleanPath))
+				return nil, errors.New("upstream returned nil response")
+			}
+			s.stats.Log("WARN", fmt.Sprintf("[FETCH-STATUS] %s: %d", cleanPath, resp.StatusCode))
+			return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+		defer resp.Body.Close()
+
+		ct := resp.Header.Get("Content-Type")
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			etag = resp.Header.Get("Etag")
+		}
+
+		// If conditional request headers already match upstream response headers, close body and return 304 without buffering.
+		if isCond {
+			headerMeta := &cache.CacheItem{
+				ContentType:     ct,
+				ContentEncoding: resp.Header.Get("Content-Encoding"),
+				ETag:            etag,
+				LastModified:    resp.Header.Get("Last-Modified"),
+			}
+			if isClientNotModified(req, headerMeta) {
+				finishUpstream(nil, headerElapsed)
+				_ = resp.Body.Close()
+				leaderStreamed = true
+				s.sendNotModifiedResponse(w, headerMeta, req.URL.Path, req.Close)
+				return nil, nil
+			}
+		}
+
+		const smallAssetThreshold int64 = 16 * 1024 // 16 KB
+
+		// Case 1: Known small asset: execute batch mode
+		if resp.ContentLength >= 0 && resp.ContentLength <= smallAssetThreshold {
+			limitBytes := smallAssetThreshold
+			data, err := io.ReadAll(io.LimitReader(resp.Body, limitBytes+1))
+			if err != nil {
+				finishUpstream(err, time.Since(fetchStart))
+				return nil, err
+			}
+			finishUpstream(nil, time.Since(fetchStart))
+			if int64(len(data)) > limitBytes {
+				return nil, fmt.Errorf("asset exceeded batch limit")
+			}
+
+			if !cache.IsValidCacheContent(cleanPath, ct, data) {
+				if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+					return fb, nil
+				}
+				return nil, fmt.Errorf("invalid cache content")
+			}
+
+			headersMap := make(map[string]string)
+			for k, vv := range resp.Header {
+				if len(vv) > 0 {
+					headersMap[strings.ToLower(k)] = vv[0]
+				}
+			}
+			if etag != "" {
+				headersMap["etag"] = etag
+			}
+
+			savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, data)
+			if !ok || savedItem == nil {
+				savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, data)
+			}
+
+			if s.prefetch != nil {
+				s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, data)
+			}
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(data)))
+			return savedItem, nil
+		}
+
+		// Read first chunk (up to 4KB) for early validation
+		initialBuf := make([]byte, 4096)
+		n, readErr := io.ReadFull(resp.Body, initialBuf)
+		initialElapsed := time.Since(fetchStart)
+		if n == 0 && readErr != nil {
+			finishUpstream(readErr, initialElapsed)
+			return nil, readErr
+		}
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			finishUpstream(readErr, initialElapsed)
+			return nil, readErr
+		}
+		initialChunk := initialBuf[:n]
+
+		// If the entire payload was <= 4KB (e.g. unknown Content-Length but small file)
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			if resp.ContentLength >= 0 && int64(n) != resp.ContentLength {
+				truncErr := fmt.Errorf("upstream stream truncated during initial read: read %d, want %d: %w", n, resp.ContentLength, io.ErrUnexpectedEOF)
+				finishUpstream(truncErr, initialElapsed)
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: upstream stream truncated during initial read: read %d, want %d", cleanPath, n, resp.ContentLength))
+				return nil, truncErr
+			}
+			finishUpstream(nil, initialElapsed)
+
+			if !cache.IsValidCacheContent(cleanPath, ct, initialChunk) {
+				if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+					return fb, nil
+				}
+				return nil, fmt.Errorf("invalid cache content")
+			}
+
+			headersMap := make(map[string]string)
+			for k, vv := range resp.Header {
+				if len(vv) > 0 {
+					headersMap[strings.ToLower(k)] = vv[0]
+				}
+			}
+			if etag != "" {
+				headersMap["etag"] = etag
+			}
+
+			savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, initialChunk)
+			if !ok || savedItem == nil {
+				savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, initialChunk)
+			}
+
+			if s.prefetch != nil {
+				s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, initialChunk)
+			}
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(initialChunk)))
+			return savedItem, nil
+		}
+
+		// Early fast-rejection check
+		if !cache.CanEarlyStream(cleanPath, ct, initialChunk) {
+			// Early check rejected (e.g. HTML error page or magic byte mismatch, or uncertain gzip):
+			// Conservative bounded fallback up to maxRAMItemSize
+			remLimit := maxRAMItemSize - int64(len(initialChunk))
+			if remLimit < 0 {
+				remLimit = 0
+			}
+			rest, rErr := io.ReadAll(io.LimitReader(resp.Body, remLimit+1))
+			if rErr != nil {
+				finishUpstream(rErr, time.Since(fetchStart))
+				return nil, rErr
+			}
+			finishUpstream(nil, time.Since(fetchStart))
+			if int64(len(rest)) > remLimit {
+				if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+					return fb, nil
+				}
+				return nil, fmt.Errorf("invalid cache content")
+			}
+			fullData := append(initialChunk, rest...)
+			if !cache.IsValidCacheContent(cleanPath, ct, fullData) {
+				if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+					return fb, nil
+				}
+				return nil, fmt.Errorf("invalid cache content")
+			}
+
+			headersMap := make(map[string]string)
+			for k, vv := range resp.Header {
+				if len(vv) > 0 {
+					headersMap[strings.ToLower(k)] = vv[0]
+				}
+			}
+			if etag != "" {
+				headersMap["etag"] = etag
+			}
+
+			savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, fullData)
+			if !ok || savedItem == nil {
+				savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, fullData)
+			}
+
+			if s.prefetch != nil {
+				s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, fullData)
+			}
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(fullData)))
+			return savedItem, nil
+		}
+
+		// Early check passed: Stream-Through to client starts!
+		// Pause upstream watchdog while writing to client and local disk.
+		tracker.pause()
+		leaderStreamed = true
+		if hErr := s.writeStreamResponseHeader(w, resp, req.URL.Path, req.Close); hErr != nil {
+			clientWriteFailed = true
+		}
+
+		var dUpstream, dClient, dDisk time.Duration
+
+		sc := &streamClientWriter{
+			w:         w,
+			isChunked: (resp.ContentLength < 0),
+			failed:    clientWriteFailed,
+		}
+		tClientInit := time.Now()
+		if err := sc.WriteChunk(initialChunk); err != nil {
+			clientWriteFailed = true
+		}
+		dClient += time.Since(tClientInit)
+
+		var tmpFile *os.File
+		var tmpPath string
+		var gen uint64
+		var isSpilledToDisk bool
+		var committed bool
+		var cacheDisabled bool
+		var memBuf *bytes.Buffer
+
+		disableCache := func(reason string, err error) {
+			if !cacheDisabled {
+				cacheDisabled = true
+				if err != nil {
+					s.stats.Log("WARN", fmt.Sprintf("[FETCH-CACHE] %s: %s: %v, abandoning cache", cleanPath, reason, err))
+				} else {
+					s.stats.Log("WARN", fmt.Sprintf("[FETCH-CACHE] %s: %s, abandoning cache", cleanPath, reason))
+				}
+				if tmpFile != nil {
+					_ = tmpFile.Close()
+					tmpFile = nil
+				}
+				if tmpPath != "" {
+					s.cacheMgr.DiscardDiskTempFile(tmpPath)
+					tmpPath = ""
+				}
+				memBuf = nil
+			}
+		}
+
+		defer func() {
+			if tmpFile != nil {
+				_ = tmpFile.Close()
+			}
+			if tmpPath != "" && !committed {
+				s.cacheMgr.DiscardDiskTempFile(tmpPath)
+			}
+		}()
+
+		if resp.ContentLength > maxRAMItemSize {
+			var tfErr error
+			tmpFile, tmpPath, gen, tfErr = s.cacheMgr.CreateDiskTempFile(ns, req.URL.Path)
+			if tfErr != nil {
+				disableCache("failed to create disk temp file", tfErr)
+			} else {
+				tDiskInit := time.Now()
+				_, wErr := tmpFile.Write(initialChunk)
+				dDisk += time.Since(tDiskInit)
+				if wErr != nil {
+					disableCache("failed to write initial chunk to disk temp file", wErr)
+				} else {
+					isSpilledToDisk = true
+				}
+			}
+		}
+
+		if !isSpilledToDisk && !cacheDisabled {
+			capHint := 64 * 1024
+			if resp.ContentLength > 0 && resp.ContentLength <= maxRAMItemSize && resp.ContentLength <= int64(math.MaxInt) {
+				capHint = int(resp.ContentLength)
+			}
+			memBuf = bytes.NewBuffer(make([]byte, 0, capHint))
+			memBuf.Write(initialChunk)
+		}
+
+		bufPtr := streamBufferPool.Get().(*[]byte)
+		defer streamBufferPool.Put(bufPtr)
+		copyBuf := *bufPtr
+		var totalRead int64 = int64(len(initialChunk))
+
+		for {
+			tracker.resume(s, route, trial, initialElapsed+dUpstream)
+			tRead := time.Now()
+			nr, rErr := resp.Body.Read(copyBuf)
+			dUpstream += time.Since(tRead)
+			tracker.pause()
+
+			if nr > 0 {
+				chunk := copyBuf[:nr]
+				totalRead += int64(nr)
+
+				tClient := time.Now()
+				if err := sc.WriteChunk(chunk); err != nil {
+					clientWriteFailed = true
+				}
+				dClient += time.Since(tClient)
+
+				if !cacheDisabled {
+					if isSpilledToDisk {
+						tDisk := time.Now()
+						_, wErr := tmpFile.Write(chunk)
+						dDisk += time.Since(tDisk)
+						if wErr != nil {
+							disableCache("failed to write chunk to disk temp file", wErr)
+						}
+					} else {
+						if int64(memBuf.Len()+nr) > maxRAMItemSize {
+							var tfErr error
+							tmpFile, tmpPath, gen, tfErr = s.cacheMgr.CreateDiskTempFile(ns, req.URL.Path)
+							if tfErr != nil {
+								disableCache("failed to create disk temp file on spill", tfErr)
+							} else {
+								tDisk := time.Now()
+								_, wErr1 := tmpFile.Write(memBuf.Bytes())
+								var wErr2 error
+								if wErr1 == nil {
+									_, wErr2 = tmpFile.Write(chunk)
+								}
+								dDisk += time.Since(tDisk)
+								if wErr1 != nil {
+									disableCache("failed to write memory buffer to disk temp file on spill", wErr1)
+								} else if wErr2 != nil {
+									disableCache("failed to write chunk to disk temp file on spill", wErr2)
+								} else {
+									memBuf = nil
+									isSpilledToDisk = true
+								}
+							}
+						} else {
+							memBuf.Write(chunk)
+						}
+					}
+				}
+			}
+
+			if rErr != nil {
+				if rErr == io.EOF {
+					break
+				}
+				finishUpstream(rErr, initialElapsed+dUpstream)
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: upstream stream truncated: %v", cleanPath, rErr))
+				return nil, rErr
+			}
+		}
+
+		tFinish := time.Now()
+		if err := sc.Finish(); err != nil {
+			clientWriteFailed = true
+		}
+		dClient += time.Since(tFinish)
+
+		if resp.ContentLength >= 0 && totalRead != resp.ContentLength {
+			mismatchErr := fmt.Errorf("content length mismatch")
+			finishUpstream(mismatchErr, initialElapsed+dUpstream)
+			s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: length mismatch: read %d, want %d", cleanPath, totalRead, resp.ContentLength))
+			return nil, mismatchErr
+		}
+		finishUpstream(nil, initialElapsed+dUpstream)
+
+		if cacheDisabled {
+			return nil, errStreamCacheSinkDisabled
+		}
+
+		headersMap := make(map[string]string)
+		for k, vv := range resp.Header {
+			if len(vv) > 0 {
+				headersMap[strings.ToLower(k)] = vv[0]
+			}
+		}
+		if etag != "" {
+			headersMap["etag"] = etag
+		}
+
+		if isSpilledToDisk {
+			_ = tmpFile.Close()
+			tmpFile = nil
+
+			if !cache.IsValidCacheFile(cleanPath, ct, tmpPath) {
+				if _, statErr := os.Stat(tmpPath); statErr != nil {
+					disableCache("failed to open disk temp file for validation", statErr)
+					return nil, nil
+				}
+				disableCache("invalid cache content after disk stream", nil)
+				return nil, errInvalidPostStreamCache
+			}
+
+			savedItem, ok := s.cacheMgr.CommitDiskTempFile(ns, req.URL.Path, headersMap, tmpPath, totalRead, gen)
+			if !ok || savedItem == nil {
+				disableCache("failed to commit disk temp file to cache", nil)
+				return nil, nil
+			}
+			committed = true
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET-DISK] 200 %dms (net:%dms, cli:%dms, disk:%dms) -> %s%s (%d B)",
+				time.Since(fetchStart).Milliseconds(),
+				(initialElapsed + dUpstream).Milliseconds(),
+				dClient.Milliseconds(),
+				dDisk.Milliseconds(),
+				targetHost, cleanPath, totalRead))
+			return savedItem, nil
+		}
+
+		fullData := memBuf.Bytes()
+		if !cache.IsValidCacheContent(cleanPath, ct, fullData) {
+			disableCache("invalid cache content after stream", nil)
+			return nil, errInvalidPostStreamCache
+		}
+
+		savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, fullData)
+		if !ok || savedItem == nil {
+			disableCache("failed to store asset in RAM cache", nil)
+			return buildTransientCacheItem(ns, req.URL.Path, headersMap, fullData), nil
+		}
+
+		if s.prefetch != nil {
+			s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, fullData)
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(fullData)))
+		return savedItem, nil
+	})
+
+	if leaderStreamed {
+		if err != nil && !errors.Is(err, errStreamCacheSinkDisabled) && !errors.Is(err, errInvalidPostStreamCache) {
+			return false
+		}
+		if clientWriteFailed {
+			return false
+		}
+		return !req.Close
+	}
+
+	if reqCtx.Err() != nil {
+		return false
+	}
+
+	if err != nil {
+		if errors.Is(err, errHeadCannotBeGetLeader) {
+			if isHead {
+				return s.handleStaticAssetHeadMiss(w, req, targetHost, ns, cleanPath, isCond)
+			}
+			return s.serveStaticAssetFollowerFallback(w, req, targetHost, ns, cleanPath, isHead, isCond, allowRetry)
+		}
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+
+	if res == nil {
+		return s.serveStaticAssetFollowerFallback(w, req, targetHost, ns, cleanPath, isHead, isCond, allowRetry)
+	}
+
+	cachedItem := res.(*cache.CacheItem)
+	s.cacheMgr.TouchRAMWithNamespace(ns, req.URL.Path)
+	if isClientNotModified(req, cachedItem) {
+		s.sendNotModifiedResponse(w, cachedItem, req.URL.Path, req.Close)
+		return !req.Close
+	}
+	if !isHead && len(cachedItem.Data) == 0 && cachedItem.Size > 0 {
+		if ok, keepAlive := s.streamCachedDiskItemToClient(w, req, ns, cachedItem); ok {
+			return keepAlive
+		}
+		s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: failed to stream disk item for follower, falling back", cleanPath))
+		return s.serveStaticAssetFollowerFallback(w, req, targetHost, ns, cleanPath, isHead, isCond, allowRetry)
+	}
+	s.sendAssetResponse(w, 200, cachedItem, isHead, req.URL.Path, req.Close)
+	return !req.Close
+}
+
+type headMissResult struct {
+	item       *cache.CacheItem
+	statusCode int
+}
+
+// handleStaticAssetHeadMiss handles cold cache miss HEAD requests by issuing an upstream HEAD request.
+// It coalesces concurrent HEAD requests on flightKey "head:<ns>:<cleanPath>" (isolated from GET SingleFlight),
+// reads zero upstream body bytes, preserves RFC 9110 Range ignoring and conditional semantics,
+// and never commits incomplete metadata items into RAM or disk cache.
+func (s *ProxyServer) handleStaticAssetHeadMiss(w io.Writer, req *http.Request, targetHost, ns, cleanPath string, isCond bool) bool {
+	// 1. Fast check if asset was just committed to cache by a concurrent GET
+	if cached, _ := s.cacheMgr.VerifyAndGetMetadataWithNamespace(ns, req.URL.Path); cached != nil {
+		if isClientNotModified(req, cached) {
+			s.sendNotModifiedResponse(w, cached, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		s.sendCachedAssetResponseFast(w, cached, true, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	flightKey := "head:" + ns + ":" + cleanPath
+	reqCtx := req.Context()
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+
+	res, err := s.cacheMgr.SingleFlight().DoContext(reqCtx, flightKey, func() (interface{}, error) {
+		// Double check cache inside SingleFlight leader in case a concurrent GET committed
+		if cached, _ := s.cacheMgr.VerifyAndGetMetadataWithNamespace(ns, req.URL.Path); cached != nil {
+			return &headMissResult{item: cached, statusCode: http.StatusOK}, nil
+		}
+
+		upURL := fmt.Sprintf("https://%s%s", targetHost, req.URL.RequestURI())
+		upReq, err := http.NewRequestWithContext(context.Background(), http.MethodHead, upURL, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		for k, vv := range req.Header {
+			// RFC 9110: Strip Range and If-Range on HEAD requests
+			if isHopByHop(k) || strings.EqualFold(k, "range") || strings.EqualFold(k, "if-range") {
+				continue
+			}
+			// Only forward conditional headers if this is a conditional request
+			if !isCond && (strings.EqualFold(k, "if-none-match") || strings.EqualFold(k, "if-modified-since")) {
+				continue
+			}
+			for _, v := range vv {
+				upReq.Header.Add(k, v)
+			}
+		}
+		upReq.Host = targetHost
+
+		assetClient, route, trial := s.getAssetClientForRequest(req.Method)
+		tracker := s.startInFlightWatch(route, trial)
+		fetchStart := time.Now()
+		resp, fetchErr := assetClient.Do(s.tracedRequest(upReq))
+		headerElapsed := time.Since(fetchStart)
+		if fetchErr == nil && resp != nil && s.telemetryEnabled() {
+			s.stats.RecordProtocol(resp.Proto)
+			s.stats.RecordLatency(float64(headerElapsed.Milliseconds()))
+		}
+
+		var finishOnce sync.Once
+		finishUpstream := func(uErr error, elapsed time.Duration) {
+			finishOnce.Do(func() {
+				s.finishInFlightWatch(tracker, route, trial, elapsed, uErr)
+			})
+		}
+		defer func() {
+			finishUpstream(fetchErr, time.Since(fetchStart))
+		}()
+
+		if fetchErr != nil || resp == nil {
+			obsErr := fetchErr
+			if obsErr == nil {
+				obsErr = errors.New("upstream returned nil response")
+			}
+			finishUpstream(obsErr, headerElapsed)
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return &headMissResult{item: fb, statusCode: http.StatusOK}, nil
+			}
+			s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] HEAD %s: %v", cleanPath, obsErr))
+			return nil, obsErr
+		}
+		defer resp.Body.Close()
+
+		// Read up to 512 bytes sample in case of unexpected body on error, but for HEAD it will be 0 bytes EOF.
+		sample, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		finishUpstream(nil, headerElapsed)
+
+		ct := resp.Header.Get("Content-Type")
+		etag := resp.Header.Get("ETag")
+		if etag == "" {
+			etag = resp.Header.Get("Etag")
+		}
+
+		if resp.StatusCode == http.StatusNotModified {
+			return &headMissResult{
+				statusCode: http.StatusNotModified,
+				item: &cache.CacheItem{
+					Key:             cleanPath,
+					ContentType:     ct,
+					ContentEncoding: resp.Header.Get("Content-Encoding"),
+					ETag:            etag,
+					LastModified:    resp.Header.Get("Last-Modified"),
+					Size:            resp.ContentLength,
+				},
+			}, nil
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return &headMissResult{item: fb, statusCode: http.StatusOK}, nil
+			}
+			s.stats.Log("WARN", fmt.Sprintf("[FETCH-STATUS] HEAD %s: %d", cleanPath, resp.StatusCode))
+			return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+
+		if isUpstreamHTMLPayload(ct, sample) {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return &headMissResult{item: fb, statusCode: http.StatusOK}, nil
+			}
+			return nil, fmt.Errorf("upstream html payload")
+		}
+
+		contentLength := resp.ContentLength
+		if contentLength < 0 {
+			if parsedCL, err := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64); err == nil && parsedCL >= 0 {
+				contentLength = parsedCL
+			}
+		}
+
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET-HEAD] 200 %dms -> %s%s (%d B metadata)",
+			headerElapsed.Milliseconds(), targetHost, cleanPath, contentLength))
+
+		return &headMissResult{
+			statusCode: http.StatusOK,
+			item: &cache.CacheItem{
+				Key:             cleanPath,
+				ContentType:     ct,
+				ContentEncoding: resp.Header.Get("Content-Encoding"),
+				ETag:            etag,
+				LastModified:    resp.Header.Get("Last-Modified"),
+				Size:            contentLength,
+			},
+		}, nil
+	})
+
+	if err != nil || res == nil {
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, true, req.Close)
+		return !req.Close
+	}
+
+	headRes := res.(*headMissResult)
+	if headRes.statusCode == http.StatusNotModified || (isCond && isClientNotModified(req, headRes.item)) {
+		s.sendNotModifiedResponse(w, headRes.item, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	s.sendAssetResponse(w, headRes.statusCode, headRes.item, true, req.URL.Path, req.Close)
+	return !req.Close
+}
+
+var (
+	errStreamCacheSinkDisabled = errors.New("stream cache sink disabled")
+	errInvalidPostStreamCache  = errors.New("invalid cache content after stream")
+	errHeadCannotBeGetLeader   = errors.New("head request cannot act as get leader")
+)
+
+func buildTransientCacheItem(ns, urlPath string, headers map[string]string, data []byte) *cache.CacheItem {
+	cleanKey := strings.TrimPrefix(strings.Split(urlPath, "?")[0], "/")
+	if ns != "" && ns != "gbf" {
+		cleanKey = ns + ":" + cleanKey
+	}
+	ct := headers["content-type"]
+	ce := headers["content-encoding"]
+	if !(len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b) && ce == "gzip" {
+		ce = ""
+	}
+	etag := headers["etag"]
+	lastMod := headers["last-modified"]
+	return &cache.CacheItem{
+		Key:             cleanKey,
+		Data:            data,
+		ContentType:     ct,
+		ContentEncoding: ce,
+		ETag:            etag,
+		LastModified:    lastMod,
+		Size:            int64(len(data)),
+	}
+}
+
+func (s *ProxyServer) streamCachedDiskItemToClient(w io.Writer, req *http.Request, ns string, item *cache.CacheItem) (bool, bool) {
+	rc, actualSize, err := s.cacheMgr.OpenDiskStream(ns, req.URL.Path)
+	if err != nil || actualSize != item.Size || actualSize <= 0 {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		return false, false
+	}
+	defer rc.Close()
+
+	s.sendCachedAssetResponseFast(w, item, true, req.URL.Path, req.Close)
+	bufPtr := streamBufferPool.Get().(*[]byte)
+	defer streamBufferPool.Put(bufPtr)
+	written, copyErr := copyStreamBuffer(w, io.LimitReader(rc, actualSize), *bufPtr)
+	if copyErr != nil || written != actualSize {
+		return true, false
+	}
+	return true, !req.Close
+}
+
+func (s *ProxyServer) serveDiskRangeResponse(w io.Writer, req *http.Request, ns string, item *cache.CacheItem, start, end, totalSize int64) (bool, bool) {
+	partLen := end - start + 1
+	if partLen <= 0 || start < 0 || end >= totalSize {
+		return false, false
+	}
+	rc, actualSize, err := s.cacheMgr.OpenDiskStream(ns, req.URL.Path)
+	if err != nil || actualSize != totalSize {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		return false, false
+	}
+	defer rc.Close()
+
+	if seeker, ok := rc.(io.Seeker); ok {
+		if _, err := seeker.Seek(start, io.SeekStart); err != nil {
+			return false, false
+		}
+	} else if start > 0 {
+		if _, err := io.CopyN(io.Discard, rc, start); err != nil {
+			return false, false
+		}
+	}
+
+	maxRAMItemSize := s.cacheMgr.MaxRAMItemSize()
+	if maxRAMItemSize <= 0 {
+		maxRAMItemSize = 16 * 1024 * 1024
+	}
+
+	if partLen <= maxRAMItemSize {
+		partBuf := make([]byte, partLen)
+		if _, err := io.ReadFull(rc, partBuf); err != nil {
+			return false, false
+		}
+		s.sendCachedRangeResponseWithBody(w, item, start, end, totalSize, partBuf, false, req.URL.Path, req.Close)
+		return true, !req.Close
+	}
+
+	// Stream range exceeding maxRAMItemSize using pooled buffer
+	s.sendCachedRangeResponseWithBody(w, item, start, end, totalSize, nil, true, req.URL.Path, req.Close)
+	bufPtr := streamBufferPool.Get().(*[]byte)
+	defer streamBufferPool.Put(bufPtr)
+	written, copyErr := copyStreamBuffer(w, io.LimitReader(rc, partLen), *bufPtr)
+	if copyErr != nil || written != partLen {
+		return true, false
+	}
+	return true, !req.Close
+}
+
+func (s *ProxyServer) serveStaticAssetFollowerFallback(w io.Writer, req *http.Request, targetHost, ns, cleanPath string, isHead, isCond, allowRetry bool) bool {
+	// 1. Check if asset is already available in cache (e.g. prefetch leader exited early after HasCacheWithNamespace)
+	cached, _ := s.cacheMgr.VerifyAndGetMetadataWithNamespace(ns, req.URL.Path)
+	if cached != nil {
+		s.cacheMgr.TouchRAMWithNamespace(ns, req.URL.Path)
+		if isClientNotModified(req, cached) {
+			s.sendNotModifiedResponse(w, cached, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		if isHead {
+			s.sendCachedAssetResponseFast(w, cached, true, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		if cached.Data != nil {
+			s.sendCachedAssetResponseFast(w, cached, false, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		maxRAMItemSize := s.cacheMgr.MaxRAMItemSize()
+		if maxRAMItemSize <= 0 {
+			maxRAMItemSize = 16 * 1024 * 1024
+		}
+		if cached.Size <= maxRAMItemSize {
+			if fullItem, _ := s.cacheMgr.GetWithNamespace(ns, req.URL.Path); fullItem != nil && fullItem.Data != nil {
+				s.sendCachedAssetResponseFast(w, fullItem, false, req.URL.Path, req.Close)
+				return !req.Close
+			}
+		} else {
+			if ok, keepAlive := s.streamCachedDiskItemToClient(w, req, ns, cached); ok {
+				return keepAlive
+			}
+		}
+	}
+
+	// 2. Re-enter SingleFlight + bounded streaming/disk-spill pipeline at most once so concurrent
+	// followers coalesce instead of triggering an upstream request storm or unbounded io.ReadAll.
+	if allowRetry {
+		return s.serveStaticAssetCore(w, req, targetHost, ns, cleanPath, isHead, isCond, false)
+	}
+
+	// 3. Final bounded streaming fallback (when allowRetry == false and disk/RAM cache commit failed again)
+	reqCtx := req.Context()
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	upURL := fmt.Sprintf("https://%s%s", targetHost, req.URL.RequestURI())
+	upReq, err := http.NewRequestWithContext(reqCtx, "GET", upURL, nil)
+	if err != nil {
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	for k, vv := range req.Header {
+		if isHopByHop(k) || strings.EqualFold(k, "if-none-match") || strings.EqualFold(k, "if-modified-since") {
+			continue
+		}
+		for _, v := range vv {
+			upReq.Header.Add(k, v)
+		}
+	}
+	upReq.Host = targetHost
+
+	assetClient, route, trial := s.getAssetClientForRequest(req.Method)
+	tracker := s.startInFlightWatch(route, trial)
+	fetchStart := time.Now()
+	resp, fetchErr := assetClient.Do(s.tracedRequest(upReq))
+	headerElapsed := time.Since(fetchStart)
+
+	var finishOnce sync.Once
+	finishUpstream := func(uErr error, elapsed time.Duration) {
+		finishOnce.Do(func() {
+			s.finishInFlightWatch(tracker, route, trial, elapsed, uErr)
+		})
+	}
+	defer func() {
+		finishUpstream(fetchErr, time.Since(fetchStart))
+	}()
+
+	if fetchErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		obsErr := fetchErr
+		if obsErr == nil {
+			if resp == nil {
+				obsErr = errors.New("upstream returned nil response")
+			} else if trial || resp.StatusCode >= http.StatusInternalServerError {
+				obsErr = fmt.Errorf("upstream returned %d", resp.StatusCode)
+			}
+		}
+		finishUpstream(obsErr, headerElapsed)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+			s.sendAssetResponse(w, http.StatusOK, fb, isHead, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	defer resp.Body.Close()
+
+	ct := resp.Header.Get("Content-Type")
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		etag = resp.Header.Get("Etag")
+	}
+	headerMeta := &cache.CacheItem{
+		ContentType:     ct,
+		ContentEncoding: resp.Header.Get("Content-Encoding"),
+		ETag:            etag,
+		LastModified:    resp.Header.Get("Last-Modified"),
+		Size:            resp.ContentLength,
+	}
+	if isClientNotModified(req, headerMeta) {
+		finishUpstream(nil, headerElapsed)
+		s.sendNotModifiedResponse(w, headerMeta, req.URL.Path, req.Close)
+		return !req.Close
+	}
+	if isHead {
+		finishUpstream(nil, headerElapsed)
+		s.sendAssetResponse(w, http.StatusOK, headerMeta, true, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	initialBuf := make([]byte, 4096)
+	n, readErr := io.ReadFull(resp.Body, initialBuf)
+	initialElapsed := time.Since(fetchStart)
+	if n == 0 && readErr != nil && readErr != io.EOF {
+		finishUpstream(readErr, initialElapsed)
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		finishUpstream(readErr, initialElapsed)
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	initialChunk := initialBuf[:n]
+	if isUpstreamHTMLPayload(ct, initialChunk) {
+		finishUpstream(nil, initialElapsed)
+		if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+			s.sendAssetResponse(w, http.StatusOK, fb, isHead, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+
+	tracker.pause()
+	if err := s.writeStreamResponseHeader(w, resp, req.URL.Path, req.Close); err != nil {
+		finishUpstream(nil, initialElapsed)
+		return false
+	}
+	sc := &streamClientWriter{
+		w:         w,
+		isChunked: (resp.ContentLength < 0),
+	}
+	if err := sc.WriteChunk(initialChunk); err != nil {
+		finishUpstream(nil, initialElapsed)
+		return false
+	}
+	if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+		finishUpstream(nil, initialElapsed)
+		if err := sc.Finish(); err != nil {
+			return false
+		}
+		return !req.Close
+	}
+
+	bufPtr := streamBufferPool.Get().(*[]byte)
+	defer streamBufferPool.Put(bufPtr)
+	copyBuf := *bufPtr
+	var dUpstream time.Duration
+	for {
+		tracker.resume(s, route, trial, initialElapsed+dUpstream)
+		tRead := time.Now()
+		nr, rErr := resp.Body.Read(copyBuf)
+		dUpstream += time.Since(tRead)
+		tracker.pause()
+		if nr > 0 {
+			if err := sc.WriteChunk(copyBuf[:nr]); err != nil {
+				finishUpstream(nil, initialElapsed+dUpstream)
+				return false
+			}
+		}
+		if rErr != nil {
+			if rErr == io.EOF {
+				break
+			}
+			finishUpstream(rErr, initialElapsed+dUpstream)
+			return false
+		}
+	}
+	finishUpstream(nil, initialElapsed+dUpstream)
+	if err := sc.Finish(); err != nil {
+		return false
+	}
+	return !req.Close
+}
+
+func isIfRangeMatched(ifRange string, item *cache.CacheItem) bool {
+	ifRange = strings.TrimSpace(ifRange)
+	if ifRange == "" || item == nil {
+		return true
+	}
+	if strings.HasPrefix(ifRange, "\"") || strings.HasPrefix(ifRange, "W/\"") || strings.HasPrefix(ifRange, "w/\"") {
+		if strings.HasPrefix(ifRange, "W/") || strings.HasPrefix(ifRange, "w/") || strings.HasPrefix(item.ETag, "W/") || strings.HasPrefix(item.ETag, "w/") {
+			return false
+		}
+		return item.ETag != "" && matchETag(ifRange, item.ETag)
+	}
+	if item.LastModified == "" {
+		return false
+	}
+	if ifRange == item.LastModified {
+		return true
+	}
+	t1, err1 := http.ParseTime(ifRange)
+	t2, err2 := http.ParseTime(item.LastModified)
+	return err1 == nil && err2 == nil && t1.Equal(t2)
+}
+
+// parseSingleByteRange parses a single HTTP Range header ("bytes=start-end", "bytes=start-", "bytes=-suffix").
+// Returns:
+// - status = 206 (http.StatusPartialContent) with inclusive [start, end] when valid and satisfiable
+// - status = 416 (http.StatusRequestedRangeNotSatisfiable) when syntax is valid but range is unsatisfiable
+// - status = 200 (http.StatusOK) when Range syntax is invalid/unsupported unit (ignore Range per RFC 7233)
+// - status = 0 when multiple ranges ("bytes=a-b,c-d") are requested so caller can delegate to upstream
+func parseSingleByteRange(rangeHdr string, size int64) (start, end int64, status int) {
+	rangeHdr = strings.TrimSpace(rangeHdr)
+	if len(rangeHdr) < 6 || !strings.EqualFold(rangeHdr[:6], "bytes=") {
+		return 0, 0, http.StatusOK
+	}
+	spec := strings.TrimSpace(rangeHdr[6:])
+	if spec == "" {
+		return 0, 0, http.StatusOK
+	}
+	if strings.Contains(spec, ",") {
+		return 0, 0, 0
+	}
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0, 0, http.StatusOK
+	}
+	startStr := strings.TrimSpace(spec[:dash])
+	endStr := strings.TrimSpace(spec[dash+1:])
+	if startStr == "" {
+		if endStr == "" {
+			return 0, 0, http.StatusOK
+		}
+		suffix, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil || suffix < 0 {
+			return 0, 0, http.StatusOK
+		}
+		if suffix == 0 || size <= 0 {
+			return 0, 0, http.StatusRequestedRangeNotSatisfiable
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, size - 1, http.StatusPartialContent
+	}
+
+	sVal, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || sVal < 0 {
+		return 0, 0, http.StatusOK
+	}
+	if size <= 0 || sVal >= size {
+		return 0, 0, http.StatusRequestedRangeNotSatisfiable
+	}
+	if endStr == "" {
+		return sVal, size - 1, http.StatusPartialContent
+	}
+	eVal, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil || eVal < sVal {
+		return 0, 0, http.StatusOK
+	}
+	if eVal >= size {
+		eVal = size - 1
+	}
+	return sVal, eVal, http.StatusPartialContent
+}
+
+func parseContentRangeFullSpan(cr string) (start, end, total int64, ok bool) {
+	cr = strings.TrimSpace(cr)
+	if len(cr) < 6 || !strings.EqualFold(cr[:6], "bytes ") {
+		return 0, 0, 0, false
+	}
+	rest := strings.TrimSpace(cr[6:])
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 {
+		return 0, 0, 0, false
+	}
+	spanPart := strings.TrimSpace(rest[:slash])
+	totalPart := strings.TrimSpace(rest[slash+1:])
+	dash := strings.IndexByte(spanPart, '-')
+	if dash <= 0 {
+		return 0, 0, 0, false
+	}
+	sVal, err1 := strconv.ParseInt(strings.TrimSpace(spanPart[:dash]), 10, 64)
+	eVal, err2 := strconv.ParseInt(strings.TrimSpace(spanPart[dash+1:]), 10, 64)
+	if err1 != nil || err2 != nil || sVal < 0 || eVal < sVal {
+		return 0, 0, 0, false
+	}
+	var tVal int64 = -1
+	if totalPart != "*" {
+		if parsedTotal, err3 := strconv.ParseInt(totalPart, 10, 64); err3 == nil && parsedTotal > 0 {
+			tVal = parsedTotal
+		}
+	}
+	return sVal, eVal, tVal, true
+}
+
+func (s *ProxyServer) sendCachedRangeResponse(w io.Writer, item *cache.CacheItem, start, end, totalSize int64, isHead bool, urlPath string, reqClose bool) {
+	var body []byte
+	if !isHead && int64(len(item.Data)) >= end+1 {
+		body = item.Data[start : end+1]
+	}
+	s.sendCachedRangeResponseWithBody(w, item, start, end, totalSize, body, isHead, urlPath, reqClose)
+}
+
+func (s *ProxyServer) sendCachedRangeResponseWithBody(w io.Writer, item *cache.CacheItem, start, end, totalSize int64, body []byte, isHead bool, urlPath string, reqClose bool) {
+	hdr := make(http.Header)
+	if item.ContentType != "" {
+		hdr.Set("Content-Type", item.ContentType)
+	}
+	if item.ETag != "" {
+		hdr.Set("ETag", item.ETag)
+	}
+	if item.LastModified != "" {
+		hdr.Set("Last-Modified", item.LastModified)
+	}
+	if item.ContentEncoding != "" {
+		hdr.Set("Content-Encoding", item.ContentEncoding)
+	}
+	hdr.Set("Access-Control-Allow-Origin", "*")
+	hdr.Set("Cache-Control", s.getCacheControlHeader(urlPath))
+	hdr.Set("Accept-Ranges", "bytes")
+	hdr.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
+	partLen := end - start + 1
+	hdr.Set("Content-Length", strconv.FormatInt(partLen, 10))
+
+	writeHTTPResponse(w, http.StatusPartialContent, hdr, body, isHead, reqClose)
+}
+
+func (s *ProxyServer) sendRangeNotSatisfiableResponse(w io.Writer, item *cache.CacheItem, totalSize int64, isHead bool, urlPath string, reqClose bool) {
+	hdr := make(http.Header)
+	if item != nil {
+		if item.ETag != "" {
+			hdr.Set("ETag", item.ETag)
+		}
+		if item.LastModified != "" {
+			hdr.Set("Last-Modified", item.LastModified)
+		}
+	}
+	hdr.Set("Access-Control-Allow-Origin", "*")
+	hdr.Set("Cache-Control", s.getCacheControlHeader(urlPath))
+	hdr.Set("Accept-Ranges", "bytes")
+	hdr.Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+	writeHTTPResponse(w, http.StatusRequestedRangeNotSatisfiable, hdr, nil, isHead, reqClose)
+}
+
+func isUpstreamHTMLPayload(ct string, data []byte) bool {
+	if strings.Contains(strings.ToLower(ct), "text/html") {
+		return true
+	}
+	sample := data
+	if len(sample) > 512 {
+		sample = sample[:512]
+	}
+	sLower := bytes.TrimSpace(bytes.ToLower(sample))
+	return bytes.HasPrefix(sLower, []byte("<!doctype")) ||
+		bytes.HasPrefix(sLower, []byte("<html")) ||
+		bytes.HasPrefix(sLower, []byte("<head")) ||
+		bytes.HasPrefix(sLower, []byte("<body")) ||
+		bytes.Contains(sLower, []byte("502 bad gateway")) ||
+		bytes.Contains(sLower, []byte("503 service")) ||
+		bytes.Contains(sLower, []byte("504 gateway time-out"))
+}
+
+func (s *ProxyServer) handleStaticRangeFromUpstream(w io.Writer, req *http.Request, targetHost, ns, cleanPath string, isHead bool) bool {
+	if isHead || req.Method != http.MethodGet {
+		// RFC 9110: A server MUST ignore a Range header field received with a request method other than GET.
+		reqClone := req.Clone(req.Context())
+		reqClone.Header.Del("Range")
+		reqClone.Header.Del("If-Range")
+		return s.serveStaticAssetCore(w, reqClone, targetHost, ns, cleanPath, isHead, isConditionalRequest(reqClone), true)
+	}
+
+	reqCtx := req.Context()
+	if reqCtx == nil {
+		reqCtx = context.Background()
+	}
+	upURL := fmt.Sprintf("https://%s%s", targetHost, req.URL.RequestURI())
+	upReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, upURL, nil)
+	if err != nil {
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	for k, vv := range req.Header {
+		if isHopByHop(k) || strings.EqualFold(k, "if-none-match") || strings.EqualFold(k, "if-modified-since") {
+			continue
+		}
+		for _, v := range vv {
+			upReq.Header.Add(k, v)
+		}
+	}
+	upReq.Host = targetHost
+
+	assetClient, route, trial := s.getAssetClientForRequest(req.Method)
+	tracker := s.startInFlightWatch(route, trial)
+	fetchStart := time.Now()
+	resp, fetchErr := assetClient.Do(s.tracedRequest(upReq))
+	headerElapsed := time.Since(fetchStart)
+	if fetchErr == nil && resp != nil && s.telemetryEnabled() {
+		s.stats.RecordProtocol(resp.Proto)
+		s.stats.RecordLatency(float64(headerElapsed.Milliseconds()))
+	}
+
+	var finishOnce sync.Once
+	finishUpstream := func(uErr error, elapsed time.Duration) {
+		finishOnce.Do(func() {
+			s.finishInFlightWatch(tracker, route, trial, elapsed, uErr)
+		})
+	}
+	defer func() {
+		finishUpstream(fetchErr, time.Since(fetchStart))
+	}()
+
+	if fetchErr != nil || resp == nil {
+		obsErr := fetchErr
+		if obsErr == nil {
+			obsErr = errors.New("upstream returned nil response")
+		}
+		finishUpstream(obsErr, headerElapsed)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+			return s.serveRangeFromFallbackItem(w, req, fb, isHead)
+		}
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+	defer resp.Body.Close()
+
+	var statusErr error
+	if (trial && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) || resp.StatusCode >= http.StatusInternalServerError {
+		statusErr = fmt.Errorf("upstream returned %d", resp.StatusCode)
+	}
+
+	maxRAMItemSize := s.cacheMgr.MaxRAMItemSize()
+	if maxRAMItemSize <= 0 {
+		maxRAMItemSize = 16 * 1024 * 1024
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		etag = resp.Header.Get("Etag")
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRAMItemSize+1))
+		totalElapsed := time.Since(fetchStart)
+		if readErr != nil {
+			finishUpstream(readErr, totalElapsed)
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+			return !req.Close
+		}
+		if isUpstreamHTMLPayload(ct, data) {
+			finishUpstream(statusErr, totalElapsed)
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return s.serveRangeFromFallbackItem(w, req, fb, isHead)
+			}
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+			return !req.Close
+		}
+
+		cr := resp.Header.Get("Content-Range")
+		start, end, _, spanOk := parseContentRangeFullSpan(cr)
+
+		hdr := make(http.Header)
+		if ct != "" {
+			hdr.Set("Content-Type", ct)
+		}
+		if etag != "" {
+			hdr.Set("ETag", etag)
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			hdr.Set("Last-Modified", lm)
+		}
+		if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+			hdr.Set("Content-Encoding", ce)
+		}
+		if cr != "" {
+			hdr.Set("Content-Range", cr)
+		}
+		ar := resp.Header.Get("Accept-Ranges")
+		if ar == "" {
+			ar = "bytes"
+		}
+		hdr.Set("Accept-Ranges", ar)
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Set("Cache-Control", s.getCacheControlHeader(req.URL.Path))
+
+		// If the partial response exceeded maxRAMItemSize, stream the remaining bytes using pooled buffer
+		if !isHead && int64(len(data)) > maxRAMItemSize {
+			tracker.pause()
+			if cl := resp.Header.Get("Content-Length"); cl != "" {
+				hdr.Set("Content-Length", cl)
+			} else if spanOk {
+				hdr.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			}
+			writeHTTPResponse(w, http.StatusPartialContent, hdr, nil, true, req.Close)
+			if _, wErr := w.Write(data); wErr != nil {
+				finishUpstream(statusErr, totalElapsed)
+				return false
+			}
+			bufPtr := streamBufferPool.Get().(*[]byte)
+			defer streamBufferPool.Put(bufPtr)
+			copyBuf := *bufPtr
+			var dUpstream time.Duration
+			for {
+				tracker.resume(s, route, trial, totalElapsed+dUpstream)
+				tRead := time.Now()
+				nr, rErr := resp.Body.Read(copyBuf)
+				dUpstream += time.Since(tRead)
+				tracker.pause()
+				if nr > 0 {
+					if _, wErr := w.Write(copyBuf[:nr]); wErr != nil {
+						finishUpstream(statusErr, totalElapsed+dUpstream)
+						return false
+					}
+				}
+				if rErr != nil {
+					if rErr == io.EOF {
+						break
+					}
+					finishUpstream(rErr, totalElapsed+dUpstream)
+					return false
+				}
+			}
+			finishUpstream(statusErr, totalElapsed+dUpstream)
+			return !req.Close
+		}
+
+		finishUpstream(statusErr, totalElapsed)
+		// Never store 206 Partial Content responses into the full-asset cache.
+		if isHead {
+			if cl := resp.Header.Get("Content-Length"); cl != "" {
+				hdr.Set("Content-Length", cl)
+			} else if spanOk {
+				hdr.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			}
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET-RANGE] 206 %dms -> %s%s (%d B)", totalElapsed.Milliseconds(), targetHost, cleanPath, len(data)))
+		writeHTTPResponse(w, http.StatusPartialContent, hdr, data, isHead, req.Close)
+		return !req.Close
+
+	case http.StatusOK:
+		// Preserve upstream 200 OK full-response semantics without re-slicing locally into 206 or 416.
+		// For payloads > maxRAMItemSize, use bounded streaming and disk spill pipeline.
+		return s.streamAndCacheUpstream200(w, req, resp, targetHost, ns, cleanPath, tracker, route, trial, fetchStart, headerElapsed, statusErr, finishUpstream)
+
+	case http.StatusRequestedRangeNotSatisfiable:
+		finishUpstream(statusErr, time.Since(fetchStart))
+		hdr := make(http.Header)
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			hdr.Set("Content-Range", cr)
+		}
+		if etag != "" {
+			hdr.Set("ETag", etag)
+		}
+		if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			hdr.Set("Last-Modified", lm)
+		}
+		hdr.Set("Accept-Ranges", "bytes")
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Set("Cache-Control", s.getCacheControlHeader(req.URL.Path))
+		writeHTTPResponse(w, http.StatusRequestedRangeNotSatisfiable, hdr, nil, isHead, req.Close)
+		return !req.Close
+
+	default:
+		finishUpstream(statusErr, time.Since(fetchStart))
+		if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+			return s.serveRangeFromFallbackItem(w, req, fb, isHead)
+		}
+		s.stats.Log("WARN", fmt.Sprintf("[FETCH-STATUS] %s: %d", cleanPath, resp.StatusCode))
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, isHead, req.Close)
+		return !req.Close
+	}
+}
+
+func (s *ProxyServer) serveRangeFromFallbackItem(w io.Writer, req *http.Request, fb *cache.CacheItem, isHead bool) bool {
+	if isHead || req.Method != http.MethodGet {
+		s.sendCachedAssetResponseFast(w, fb, isHead, req.URL.Path, req.Close)
+		return !req.Close
+	}
+	if isIfRangeMatched(req.Header.Get("If-Range"), fb) && fb.ContentEncoding == "" {
+		totalSize := fb.Size
+		if len(fb.Data) > 0 {
+			totalSize = int64(len(fb.Data))
+		}
+		start, end, rStatus := parseSingleByteRange(req.Header.Get("Range"), totalSize)
+		if rStatus == http.StatusPartialContent {
+			s.sendCachedRangeResponse(w, fb, start, end, totalSize, isHead, req.URL.Path, req.Close)
+			return !req.Close
+		}
+		if rStatus == http.StatusRequestedRangeNotSatisfiable {
+			s.sendRangeNotSatisfiableResponse(w, fb, totalSize, isHead, req.URL.Path, req.Close)
+			return !req.Close
+		}
+	}
+	s.sendAssetResponse(w, http.StatusOK, fb, isHead, req.URL.Path, req.Close)
+	return !req.Close
+}
+
+func (s *ProxyServer) streamAndCacheUpstream200(
+	w io.Writer,
+	req *http.Request,
+	resp *http.Response,
+	targetHost, ns, cleanPath string,
+	tracker *inFlightTracker,
+	route failoverRoute,
+	trial bool,
+	fetchStart time.Time,
+	headerElapsed time.Duration,
+	statusErr error,
+	finishUpstream func(error, time.Duration),
+) bool {
+	maxRAMItemSize := s.cacheMgr.MaxRAMItemSize()
+	if maxRAMItemSize <= 0 {
+		maxRAMItemSize = 16 * 1024 * 1024
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		etag = resp.Header.Get("Etag")
+	}
+
+	const smallAssetThreshold = 16 * 1024 // 16 KB
+
+	// Fast path for small assets whose Content-Length is known and <= 16KB
+	if resp.ContentLength >= 0 && resp.ContentLength <= smallAssetThreshold {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, smallAssetThreshold+1))
+		totalElapsed := time.Since(fetchStart)
+		if readErr != nil {
+			finishUpstream(readErr, totalElapsed)
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		finishUpstream(statusErr, totalElapsed)
+		if int64(len(data)) > smallAssetThreshold {
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		if !cache.IsValidCacheContent(cleanPath, ct, data) {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return s.serveRangeFromFallbackItem(w, req, fb, false)
+			}
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		headersMap := make(map[string]string)
+		for k, vv := range resp.Header {
+			if len(vv) > 0 {
+				headersMap[strings.ToLower(k)] = vv[0]
+			}
+		}
+		if etag != "" {
+			headersMap["etag"] = etag
+		}
+		savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, data)
+		if !ok || savedItem == nil {
+			savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, data)
+		}
+		if s.prefetch != nil {
+			s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, data)
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(data)))
+		s.sendAssetResponse(w, http.StatusOK, savedItem, false, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	// Read initial chunk (up to 4KB) for early validation
+	initialBuf := make([]byte, 4096)
+	n, readErr := io.ReadFull(resp.Body, initialBuf)
+	initialElapsed := time.Since(fetchStart)
+	if n == 0 && readErr != nil && readErr != io.EOF {
+		finishUpstream(readErr, initialElapsed)
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		finishUpstream(readErr, initialElapsed)
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+	initialChunk := initialBuf[:n]
+
+	// Payload <= 4KB
+	if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+		if resp.ContentLength >= 0 && int64(n) != resp.ContentLength {
+			finishUpstream(fmt.Errorf("upstream stream truncated: read %d, want %d", n, resp.ContentLength), initialElapsed)
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		finishUpstream(statusErr, initialElapsed)
+		if !cache.IsValidCacheContent(cleanPath, ct, initialChunk) {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return s.serveRangeFromFallbackItem(w, req, fb, false)
+			}
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		headersMap := make(map[string]string)
+		for k, vv := range resp.Header {
+			if len(vv) > 0 {
+				headersMap[strings.ToLower(k)] = vv[0]
+			}
+		}
+		if etag != "" {
+			headersMap["etag"] = etag
+		}
+		savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, initialChunk)
+		if !ok || savedItem == nil {
+			savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, initialChunk)
+		}
+		if s.prefetch != nil {
+			s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, initialChunk)
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(initialChunk)))
+		s.sendAssetResponse(w, http.StatusOK, savedItem, false, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	// Early validation check
+	if !cache.CanEarlyStream(cleanPath, ct, initialChunk) {
+		remLimit := maxRAMItemSize - int64(len(initialChunk))
+		if remLimit < 0 {
+			remLimit = 0
+		}
+		rest, rErr := io.ReadAll(io.LimitReader(resp.Body, remLimit+1))
+		if rErr != nil {
+			finishUpstream(rErr, time.Since(fetchStart))
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		finishUpstream(statusErr, time.Since(fetchStart))
+		if int64(len(rest)) > remLimit {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return s.serveRangeFromFallbackItem(w, req, fb, false)
+			}
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		fullData := append(initialChunk, rest...)
+		if !cache.IsValidCacheContent(cleanPath, ct, fullData) {
+			if fb, _ := s.cacheMgr.GetFallback(req.URL.Path); fb != nil {
+				return s.serveRangeFromFallbackItem(w, req, fb, false)
+			}
+			writeHTTPResponse(w, http.StatusBadGateway, nil, nil, false, req.Close)
+			return !req.Close
+		}
+		headersMap := make(map[string]string)
+		for k, vv := range resp.Header {
+			if len(vv) > 0 {
+				headersMap[strings.ToLower(k)] = vv[0]
+			}
+		}
+		if etag != "" {
+			headersMap["etag"] = etag
+		}
+		savedItem, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, fullData)
+		if !ok || savedItem == nil {
+			savedItem = buildTransientCacheItem(ns, req.URL.Path, headersMap, fullData)
+		}
+		if s.prefetch != nil {
+			s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, fullData)
+		}
+		s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(fullData)))
+		s.sendAssetResponse(w, http.StatusOK, savedItem, false, req.URL.Path, req.Close)
+		return !req.Close
+	}
+
+	// Early check passed: Stream-Through to client starts!
+	tracker.pause()
+	var clientWriteFailed bool
+	if hErr := s.writeStreamResponseHeader(w, resp, req.URL.Path, req.Close); hErr != nil {
+		clientWriteFailed = true
+	}
+
+	var dUpstream, dClient, dDisk time.Duration
+
+	sc := &streamClientWriter{
+		w:         w,
+		isChunked: (resp.ContentLength < 0),
+		failed:    clientWriteFailed,
+	}
+	tClientInit := time.Now()
+	if err := sc.WriteChunk(initialChunk); err != nil {
+		clientWriteFailed = true
+	}
+	dClient += time.Since(tClientInit)
+
+	if clientWriteFailed {
+		finishUpstream(statusErr, initialElapsed)
+		return false
+	}
+
+	var tmpFile *os.File
+	var tmpPath string
+	var gen uint64
+	var isSpilledToDisk bool
+	var committed bool
+	var cacheDisabled bool
+	var memBuf *bytes.Buffer
+
+	disableCache := func(reason string, err error) {
+		if !cacheDisabled {
+			cacheDisabled = true
+			if err != nil {
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-CACHE] %s: %s: %v, abandoning cache", cleanPath, reason, err))
+			} else {
+				s.stats.Log("WARN", fmt.Sprintf("[FETCH-CACHE] %s: %s, abandoning cache", cleanPath, reason))
+			}
+			if tmpFile != nil {
+				_ = tmpFile.Close()
+				tmpFile = nil
+			}
+			if tmpPath != "" {
+				s.cacheMgr.DiscardDiskTempFile(tmpPath)
+				tmpPath = ""
+			}
+			memBuf = nil
+		}
+	}
+
+	defer func() {
+		if tmpFile != nil {
+			_ = tmpFile.Close()
+		}
+		if tmpPath != "" && !committed {
+			s.cacheMgr.DiscardDiskTempFile(tmpPath)
+		}
+	}()
+
+	if resp.ContentLength > maxRAMItemSize {
+		var tfErr error
+		tmpFile, tmpPath, gen, tfErr = s.cacheMgr.CreateDiskTempFile(ns, req.URL.Path)
+		if tfErr != nil {
+			disableCache("failed to create disk temp file", tfErr)
+		} else {
+			tDiskInit := time.Now()
+			_, wErr := tmpFile.Write(initialChunk)
+			dDisk += time.Since(tDiskInit)
+			if wErr != nil {
+				disableCache("failed to write initial chunk to disk temp file", wErr)
+			} else {
+				isSpilledToDisk = true
+			}
+		}
+	}
+
+	if !isSpilledToDisk && !cacheDisabled {
+		capHint := 64 * 1024
+		if resp.ContentLength > 0 && resp.ContentLength <= maxRAMItemSize && resp.ContentLength <= int64(math.MaxInt) {
+			capHint = int(resp.ContentLength)
+		}
+		memBuf = bytes.NewBuffer(make([]byte, 0, capHint))
+		memBuf.Write(initialChunk)
+	}
+
+	bufPtr := streamBufferPool.Get().(*[]byte)
+	defer streamBufferPool.Put(bufPtr)
+	copyBuf := *bufPtr
+	var totalRead int64 = int64(len(initialChunk))
+
+	for {
+		tracker.resume(s, route, trial, initialElapsed+dUpstream)
+		tRead := time.Now()
+		nr, rErr := resp.Body.Read(copyBuf)
+		dUpstream += time.Since(tRead)
+		tracker.pause()
+
+		if nr > 0 {
+			chunk := copyBuf[:nr]
+			totalRead += int64(nr)
+
+			tClient := time.Now()
+			if err := sc.WriteChunk(chunk); err != nil {
+				clientWriteFailed = true
+				finishUpstream(statusErr, initialElapsed+dUpstream)
+				return false
+			}
+			dClient += time.Since(tClient)
+
+			if !cacheDisabled {
+				if isSpilledToDisk {
+					tDisk := time.Now()
+					_, wErr := tmpFile.Write(chunk)
+					dDisk += time.Since(tDisk)
+					if wErr != nil {
+						disableCache("failed to write chunk to disk temp file", wErr)
+					}
+				} else {
+					if int64(memBuf.Len()+nr) > maxRAMItemSize {
+						var tfErr error
+						tmpFile, tmpPath, gen, tfErr = s.cacheMgr.CreateDiskTempFile(ns, req.URL.Path)
+						if tfErr != nil {
+							disableCache("failed to create disk temp file on spill", tfErr)
+						} else {
+							tDisk := time.Now()
+							_, wErr1 := tmpFile.Write(memBuf.Bytes())
+							var wErr2 error
+							if wErr1 == nil {
+								_, wErr2 = tmpFile.Write(chunk)
+							}
+							dDisk += time.Since(tDisk)
+							if wErr1 != nil {
+								disableCache("failed to write memory buffer to disk temp file on spill", wErr1)
+							} else if wErr2 != nil {
+								disableCache("failed to write chunk to disk temp file on spill", wErr2)
+							} else {
+								memBuf = nil
+								isSpilledToDisk = true
+							}
+						}
+					} else {
+						memBuf.Write(chunk)
+					}
+				}
+			}
+		}
+
+		if rErr != nil {
+			if rErr == io.EOF {
+				break
+			}
+			finishUpstream(rErr, initialElapsed+dUpstream)
+			s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: upstream stream truncated: %v", cleanPath, rErr))
+			return false
+		}
+	}
+
+	tFinish := time.Now()
+	if err := sc.Finish(); err != nil {
+		clientWriteFailed = true
+		finishUpstream(statusErr, initialElapsed+dUpstream)
+		return false
+	}
+	dClient += time.Since(tFinish)
+
+	if resp.ContentLength >= 0 && totalRead != resp.ContentLength {
+		mismatchErr := fmt.Errorf("content length mismatch")
+		finishUpstream(mismatchErr, initialElapsed+dUpstream)
+		s.stats.Log("WARN", fmt.Sprintf("[FETCH-ERROR] %s: length mismatch: read %d, want %d", cleanPath, totalRead, resp.ContentLength))
+		return false
+	}
+	finishUpstream(statusErr, initialElapsed+dUpstream)
+
+	if !cacheDisabled {
+		headersMap := make(map[string]string)
+		for k, vv := range resp.Header {
+			if len(vv) > 0 {
+				headersMap[strings.ToLower(k)] = vv[0]
+			}
+		}
+		if etag != "" {
+			headersMap["etag"] = etag
+		}
+
+		if isSpilledToDisk {
+			_ = tmpFile.Close()
+			tmpFile = nil
+
+			if !cache.IsValidCacheFile(cleanPath, ct, tmpPath) {
+				if _, statErr := os.Stat(tmpPath); statErr != nil {
+					disableCache("failed to open disk temp file for validation", statErr)
+					return !req.Close
+				}
+				disableCache("invalid cache content after disk stream", nil)
+				return !req.Close
+			}
+
+			_, ok := s.cacheMgr.CommitDiskTempFile(ns, req.URL.Path, headersMap, tmpPath, totalRead, gen)
+			if !ok {
+				disableCache("failed to commit disk temp file to cache", nil)
+				return !req.Close
+			}
+			committed = true
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET-DISK] 200 %dms (net:%dms, cli:%dms, disk:%dms) -> %s%s (%d B)",
+				time.Since(fetchStart).Milliseconds(),
+				(initialElapsed + dUpstream).Milliseconds(),
+				dClient.Milliseconds(),
+				dDisk.Milliseconds(),
+				targetHost, cleanPath, totalRead))
+		} else if memBuf != nil {
+			fullData := memBuf.Bytes()
+			if !cache.IsValidCacheContent(cleanPath, ct, fullData) {
+				disableCache("invalid cache content after stream", nil)
+				return !req.Close
+			}
+			_, ok := s.cacheMgr.SaveRAMValidatedWithNamespace(ns, req.URL.Path, headersMap, fullData)
+			if !ok {
+				disableCache("failed to store asset in RAM cache", nil)
+				return !req.Close
+			}
+			if s.prefetch != nil {
+				s.prefetch.MaybeEnqueueDiscovery(targetHost, req.URL.Path, fullData)
+			}
+			s.stats.Log("INFO", fmt.Sprintf("[FETCH-ASSET] 200 %dms -> %s%s (%d B)", time.Since(fetchStart).Milliseconds(), targetHost, cleanPath, len(fullData)))
+		}
+	}
+
+	return !req.Close
+}
+
+func matchETag(clientETag, serverETag string) bool {
+	if clientETag == "" || serverETag == "" {
+		return false
+	}
+	clientETag = strings.TrimSpace(clientETag)
+	if clientETag == "*" {
+		return true
+	}
+	sNorm := strings.Trim(strings.TrimPrefix(serverETag, "W/"), "\"")
+	for _, part := range strings.Split(clientETag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" {
+			return true
+		}
+		cNorm := strings.Trim(strings.TrimPrefix(part, "W/"), "\"")
+		if cNorm == sNorm || part == serverETag {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ProxyServer) handleDynamicAPI(w io.Writer, req *http.Request, targetHost string) bool {
+	s.stats.IncAPI()
+	s.stats.AddActiveAPI(1)
+	defer s.stats.AddActiveAPI(-1)
+
+	startTime := time.Now()
+	var bodyBytes []byte
+	if req.Body != nil {
+		var bodyErr error
+		bodyBytes, bodyErr = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if bodyErr != nil {
+			writeHTTPResponse(w, http.StatusBadRequest, nil, nil, req.Method == http.MethodHead, req.Close)
+			return !req.Close
+		}
+	}
+	cleanPath := strings.ToLower(strings.Split(req.URL.Path, "?")[0])
+
+	// Strict P0 Safe Retry Rule:
+	// Only read-only idempotent GET requests to whitelisted paths may be retried on connection drop.
+	// All POST/PUT/DELETE requests have maxAttempts = 1 (strictly zero retry).
+	isGet := (req.Method == http.MethodGet || req.Method == http.MethodHead)
+	isRetryable := (isGet && isRetryableAPI(cleanPath))
+	maxAttempts := 1
+	if isRetryable {
+		maxAttempts = 2
+	}
+
+	upURL := fmt.Sprintf("https://%s%s", targetHost, req.URL.RequestURI())
+	var resp *http.Response
+	var respBytes []byte
+	var fetchErr error
+	var reqReused bool
+	var apiClient *http.Client
+	var route failoverRoute
+	var trial bool
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		upReq, err := newUpstreamAPIRequest(req.Context(), req, upURL, bodyBytes)
+		if err != nil {
+			fetchErr = err
+			break
+		}
+
+		for k, vv := range req.Header {
+			if isHopByHop(k) {
+				continue
+			}
+			for _, v := range vv {
+				upReq.Header.Add(k, v)
+			}
+		}
+		upReq.Host = targetHost
+
+		if attempt == 0 {
+			apiClient, route, trial = s.getAPIClientForRequest(req.Method)
+		} else {
+			trial = false
+		}
+
+		var tracker *inFlightTracker
+		if isGet {
+			tracker = s.startInFlightWatch(route, trial)
+		}
+		tracedReq, cancelAttempt := s.prepareAPIRequestTrace(upReq, func(reused bool) {
+			reqReused = reused
+		})
+		attemptStart := time.Now()
+		resp, fetchErr = apiClient.Do(tracedReq)
+
+		if fetchErr != nil || resp == nil {
+			lastAttemptElapsed := time.Since(attemptStart)
+			tracker.stop()
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			resp = nil
+			cancelAttempt(nil)
+			obsErr := fetchErr
+			if obsErr == nil {
+				obsErr = errors.New("upstream returned nil response")
+			}
+			if isGet {
+				s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, obsErr)
+			}
+			if attempt+1 < maxAttempts && isConnectionDropError(fetchErr) {
+				s.stats.IncAPIRetry()
+				continue
+			}
+			break
+		}
+
+		var readErr error
+		respBytes, readErr = io.ReadAll(resp.Body)
+		lastAttemptElapsed := time.Since(attemptStart)
+		tracker.stop()
+		_ = resp.Body.Close()
+		cancelAttempt(nil)
+		if readErr != nil {
+			if isGet {
+				s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, readErr)
+			}
+			fetchErr = readErr
+			resp = nil
+			break
+		}
+
+		var obsErr error
+		if trial && resp.StatusCode >= http.StatusInternalServerError {
+			obsErr = fmt.Errorf("upstream trial returned %d", resp.StatusCode)
+		}
+		if isGet {
+			s.finishInFlightWatch(tracker, route, trial, lastAttemptElapsed, obsErr)
+		}
+		break
+	}
+
+	if fetchErr != nil || resp == nil {
+		writeHTTPResponse(w, http.StatusBadGateway, nil, nil, req.Method == http.MethodHead, req.Close)
+		return !req.Close
+	}
+	s.forwardDynamicResponse(w, resp, respBytes, req.Method == http.MethodHead, req.Close)
+	if s.prefetch != nil && resp != nil && resp.StatusCode == http.StatusOK && len(respBytes) > 0 {
+		s.prefetch.MaybeEnqueueGameData(req, targetHost, respBytes)
+	}
+	elapsed := time.Since(startTime).Milliseconds()
+	if s.telemetryEnabled() {
+		s.stats.RecordProtocol(resp.Proto)
+		s.stats.RecordLatency(float64(elapsed))
+	}
+	reusedStr := "new"
+	if reqReused {
+		reusedStr = "reused"
+	}
+	protoStr := resp.Proto
+	if protoStr == "" {
+		protoStr = "HTTP/1.1"
+	}
+	uri := req.URL.RequestURI()
+	if !strings.HasPrefix(uri, "/") {
+		uri = "/" + uri
+	}
+	s.stats.Log("INFO", fmt.Sprintf("[BYPASS-API] %d %s %s%s (%dms, %s, %s)", resp.StatusCode, req.Method, targetHost, uri, elapsed, protoStr, reusedStr))
+	return !req.Close
+}
+
+var responseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 1024))
+	},
+}
+
+// writeHTTPResponse serializes an RFC-compliant HTTP/1.1 response to w.
+// It ensures standard Date header presence, P0-compliant header filtering
+// (zero proxy-fingerprint pollution, hop-by-hop stripping, Set-Cookie line-by-line
+// preservation), RFC 7230 content-length rules (omitted for 1xx, 204, 304), and HEAD body suppression.
+func writeHTTPResponse(w io.Writer, statusCode int, header http.Header, body []byte, isHead bool, reqClose bool) {
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= 128*1024 {
+			responseBufferPool.Put(buf)
+		}
+	}()
+
+	statusPhrase := http.StatusText(statusCode)
+	if statusPhrase == "" {
+		statusPhrase = "OK"
+	}
+
+	var numBuf [32]byte
+
+	buf.WriteString("HTTP/1.1 ")
+	buf.Write(strconv.AppendInt(numBuf[:0], int64(statusCode), 10))
+	buf.WriteByte(' ')
+	buf.WriteString(statusPhrase)
+	buf.WriteString("\r\n")
+
+	hasDate := false
+	if header != nil && header.Get("Date") != "" {
+		hasDate = true
+	}
+	if !hasDate {
+		buf.WriteString("Date: ")
+		var dateBuf [32]byte
+		buf.Write(time.Now().UTC().AppendFormat(dateBuf[:0], http.TimeFormat))
+		buf.WriteString("\r\n")
+	}
+
+	if header != nil {
+		var cookieArr [8]string
+		cookies := cookieArr[:0]
+		for k, vv := range header {
+			if strings.EqualFold(k, "set-cookie") {
+				cookies = append(cookies, vv...)
+				continue
+			}
+			if isHopByHop(k) || strings.EqualFold(k, "content-length") || strings.EqualFold(k, "connection") {
+				continue
+			}
+			if !hasDate && strings.EqualFold(k, "date") {
+				continue
+			}
+			// P0: Zero header pollution
+			if hasCaseInsensitivePrefix(k, "x-proxy-") ||
+				hasCaseInsensitivePrefix(k, "x-cache-") ||
+				hasCaseInsensitivePrefix(k, "x-acceleration-") {
+				continue
+			}
+			formattedKey := formatHeaderKey(k)
+			for _, v := range vv {
+				buf.WriteString(formattedKey)
+				buf.WriteString(": ")
+				buf.WriteString(v)
+				buf.WriteString("\r\n")
+			}
+		}
+
+		// P0: Multi-line Set-Cookie preservation (never fold into single line with commas)
+		for _, cookie := range cookies {
+			buf.WriteString("Set-Cookie: ")
+			buf.WriteString(cookie)
+			buf.WriteString("\r\n")
+		}
+	}
+
+	if statusCode != http.StatusNoContent && statusCode != http.StatusNotModified && (statusCode < 100 || statusCode >= 200) {
+		buf.WriteString("Content-Length: ")
+		if isHead && len(body) == 0 && header != nil && header.Get("Content-Length") != "" {
+			buf.WriteString(header.Get("Content-Length"))
+		} else {
+			buf.Write(strconv.AppendInt(numBuf[:0], int64(len(body)), 10))
+		}
+		buf.WriteString("\r\n")
+	}
+	if reqClose {
+		buf.WriteString("Connection: close\r\n\r\n")
+	} else {
+		buf.WriteString("Connection: keep-alive\r\n\r\n")
+	}
+
+	// Emit the serialized head plus payload through the single shared write strategy.
+	writeResponseBody(w, buf, statusCode, body, isHead)
+}
+
+// writeResponseBody emits the already-serialized response head held by buf together
+// with body. It preserves the exact write strategy shared by every response path:
+// HEAD / 204 / 304 / 1xx suppress the payload, empty payloads and payloads that fit
+// into 64 KiB are written together with the head in one write, larger payloads use
+// writev-style scattering. Keeping this in a single helper prevents the cached-asset
+// fast path from drifting away from writeHTTPResponse.
+func writeResponseBody(w io.Writer, buf *bytes.Buffer, statusCode int, body []byte, isHead bool) {
+	if isHead || statusCode == http.StatusNoContent || statusCode == http.StatusNotModified || (statusCode >= 100 && statusCode < 200) {
+		_, _ = w.Write(buf.Bytes())
+	} else if len(body) == 0 {
+		_, _ = w.Write(buf.Bytes())
+	} else if buf.Len()+len(body) <= 64*1024 {
+		buf.Write(body)
+		_, _ = w.Write(buf.Bytes())
+	} else {
+		bufs := net.Buffers{buf.Bytes(), body}
+		_, _ = bufs.WriteTo(w)
+	}
+}
+
+type streamClientWriter struct {
+	w         io.Writer
+	isChunked bool
+	failed    bool
+}
+
+func (sc *streamClientWriter) WriteChunk(chunk []byte) error {
+	if sc.failed || len(chunk) == 0 {
+		return nil
+	}
+	var err error
+	if sc.isChunked {
+		var hexBuf [16]byte
+		h := strconv.AppendInt(hexBuf[:0], int64(len(chunk)), 16)
+		if _, err = sc.w.Write(h); err == nil {
+			if _, err = sc.w.Write([]byte("\r\n")); err == nil {
+				if _, err = sc.w.Write(chunk); err == nil {
+					_, err = sc.w.Write([]byte("\r\n"))
+				}
+			}
+		}
+	} else {
+		_, err = sc.w.Write(chunk)
+	}
+	if err != nil {
+		sc.failed = true
+	}
+	return err
+}
+
+func (sc *streamClientWriter) Finish() error {
+	if sc.failed {
+		return nil
+	}
+	if sc.isChunked {
+		_, err := sc.w.Write([]byte("0\r\n\r\n"))
+		if err != nil {
+			sc.failed = true
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *ProxyServer) writeStreamResponseHeader(w io.Writer, resp *http.Response, urlPath string, reqClose bool) error {
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= 128*1024 {
+			responseBufferPool.Put(buf)
+		}
+	}()
+
+	buf.WriteString("HTTP/1.1 200 OK\r\nDate: ")
+	var dateBuf [32]byte
+	buf.Write(time.Now().UTC().AppendFormat(dateBuf[:0], http.TimeFormat))
+	buf.WriteString("\r\n")
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		buf.WriteString("Content-Type: ")
+		buf.WriteString(ct)
+		buf.WriteString("\r\n")
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		etag = resp.Header.Get("Etag")
+	}
+	if etag != "" {
+		buf.WriteString("ETag: ")
+		buf.WriteString(etag)
+		buf.WriteString("\r\n")
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		buf.WriteString("Last-Modified: ")
+		buf.WriteString(lm)
+		buf.WriteString("\r\n")
+	}
+	ce := resp.Header.Get("Content-Encoding")
+	if ce != "" {
+		buf.WriteString("Content-Encoding: ")
+		buf.WriteString(ce)
+		buf.WriteString("\r\n")
+	}
+	buf.WriteString("Access-Control-Allow-Origin: *\r\n")
+	buf.WriteString("Cache-Control: ")
+	buf.WriteString(s.getCacheControlHeader(urlPath))
+	buf.WriteString("\r\n")
+
+	if resp.ContentLength >= 0 {
+		var numBuf [32]byte
+		buf.WriteString("Content-Length: ")
+		buf.Write(strconv.AppendInt(numBuf[:0], resp.ContentLength, 10))
+		buf.WriteString("\r\n")
+	} else {
+		buf.WriteString("Transfer-Encoding: chunked\r\n")
+	}
+
+	if reqClose {
+		buf.WriteString("Connection: close\r\n\r\n")
+	} else {
+		buf.WriteString("Connection: keep-alive\r\n\r\n")
+	}
+
+	_, err := w.Write(buf.Bytes())
+	return err
+}
+
+func (s *ProxyServer) sendAssetResponse(w io.Writer, status int, item *cache.CacheItem, isHead bool, urlPath string, reqClose bool) {
+	hdr := make(http.Header)
+	if item.ContentType != "" {
+		hdr.Set("Content-Type", item.ContentType)
+	}
+	if item.ETag != "" {
+		hdr.Set("ETag", item.ETag)
+	}
+	if item.LastModified != "" {
+		hdr.Set("Last-Modified", item.LastModified)
+	}
+	if item.ContentEncoding != "" {
+		hdr.Set("Content-Encoding", item.ContentEncoding)
+	}
+	hdr.Set("Access-Control-Allow-Origin", "*")
+
+	// P1: Safe browser cache policy - immutable ONLY for versioned assets
+	hdr.Set("Cache-Control", s.getCacheControlHeader(urlPath))
+
+	if isHead && len(item.Data) == 0 && item.Size > 0 {
+		hdr.Set("Content-Length", strconv.FormatInt(item.Size, 10))
+	}
+
+	writeHTTPResponse(w, status, hdr, item.Data, isHead, reqClose)
+}
+
+// sendCachedAssetResponseFast serializes a cached-asset 200 response straight from the
+// immutable cache.CacheItem fields, avoiding the per-request http.Header map that
+// sendAssetResponse builds (map allocation + map iteration + per-key hop-by-hop and
+// fingerprint filtering) on every RAM/disk cache hit.
+//
+// The emitted header block carries exactly the same header lines as sendAssetResponse:
+// Content-Type / ETag / Last-Modified / Content-Encoding (each only when non-empty),
+// Access-Control-Allow-Origin and Cache-Control, plus the generated Date, Content-Length
+// and Connection lines. Names, values and counts are unchanged; only the line ORDER is
+// fixed here, whereas the legacy http.Header map iteration was randomly ordered. HEAD,
+// Content-Length and Connection semantics stay identical because the payload is emitted
+// through the same writeResponseBody strategy used by writeHTTPResponse.
+func (s *ProxyServer) sendCachedAssetResponseFast(w io.Writer, item *cache.CacheItem, isHead bool, urlPath string, reqClose bool) {
+	if item == nil {
+		return
+	}
+
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= 128*1024 {
+			responseBufferPool.Put(buf)
+		}
+	}()
+
+	buf.WriteString("HTTP/1.1 200 OK\r\nDate: ")
+	var dateBuf [32]byte
+	buf.Write(time.Now().UTC().AppendFormat(dateBuf[:0], http.TimeFormat))
+	buf.WriteString("\r\n")
+
+	if item.ContentType != "" {
+		buf.WriteString("Content-Type: ")
+		buf.WriteString(item.ContentType)
+		buf.WriteString("\r\n")
+	}
+	if item.ETag != "" {
+		buf.WriteString("ETag: ")
+		buf.WriteString(item.ETag)
+		buf.WriteString("\r\n")
+	}
+	if item.LastModified != "" {
+		buf.WriteString("Last-Modified: ")
+		buf.WriteString(item.LastModified)
+		buf.WriteString("\r\n")
+	}
+	if item.ContentEncoding != "" {
+		buf.WriteString("Content-Encoding: ")
+		buf.WriteString(item.ContentEncoding)
+		buf.WriteString("\r\n")
+	}
+	// Access-Control-Allow-Origin and Cache-Control are always emitted, mirroring
+	// hdr.Set which writes the line even for an empty value.
+	buf.WriteString("Access-Control-Allow-Origin: *\r\n")
+	buf.WriteString("Cache-Control: ")
+	buf.WriteString(s.getCacheControlHeader(urlPath))
+	buf.WriteString("\r\n")
+
+	contentLen := item.Size
+	if len(item.Data) > 0 {
+		contentLen = int64(len(item.Data))
+	}
+	var numBuf [32]byte
+	buf.WriteString("Content-Length: ")
+	buf.Write(strconv.AppendInt(numBuf[:0], contentLen, 10))
+	buf.WriteString("\r\n")
+	if reqClose {
+		buf.WriteString("Connection: close\r\n\r\n")
+	} else {
+		buf.WriteString("Connection: keep-alive\r\n\r\n")
+	}
+
+	writeResponseBody(w, buf, http.StatusOK, item.Data, isHead)
+}
+
+var errInvalidWrite = errors.New("invalid write result")
+
+// copyStreamBuffer copies from src to dst using the supplied buffer,
+// intentionally performing an explicit Read->Write loop rather than delegating
+// to src.(io.WriterTo) or dst.(io.ReaderFrom). This ensures the pooled buffer size
+// is strictly used, avoiding *os.File's WriterTo optimization which would otherwise
+// fall back to OS-default chunk sizes.
+//
+// It preserves standard io.CopyBuffer semantics:
+// - Returns nil error on normal EOF
+// - Propagates Read errors and Write errors
+// - Detects short writes and returns io.ErrShortWrite
+// - Accumulates written bytes accurately
+// - Correctly handles Read returning nr > 0 alongside an error (processing data before returning error)
+func copyStreamBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	if len(buf) == 0 {
+		panic("empty buffer in copyStreamBuffer")
+	}
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = errInvalidWrite
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+func (s *ProxyServer) forwardDynamicResponse(w io.Writer, resp *http.Response, body []byte, isHead bool, reqClose bool) {
+	writeHTTPResponse(w, resp.StatusCode, resp.Header, body, isHead, reqClose)
+}
+
+func isHopByHop(h string) bool {
+	return strings.EqualFold(h, "connection") ||
+		strings.EqualFold(h, "keep-alive") ||
+		strings.EqualFold(h, "proxy-authenticate") ||
+		strings.EqualFold(h, "proxy-authorization") ||
+		strings.EqualFold(h, "te") ||
+		strings.EqualFold(h, "trailers") ||
+		strings.EqualFold(h, "transfer-encoding") ||
+		strings.EqualFold(h, "upgrade")
+}
+
+func hasCaseInsensitivePrefix(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func formatHeaderKey(k string) string {
+	switch {
+	case strings.EqualFold(k, "etag"):
+		return "ETag"
+	case strings.EqualFold(k, "www-authenticate"):
+		return "WWW-Authenticate"
+	default:
+		return k
+	}
+}
+
+func isRetryableAPI(path string) bool {
+	switch path {
+	case "/rest/multiraid/condition.json",
+		"/rest/quest/stage_list",
+		"/rest/party/deck_info":
+		return true
+	}
+	return false
+}
+
+func isConnectionDropError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errTransportReplayBlocked) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "closed network connection") ||
+		strings.Contains(msg, "connection refused")
+}
+
+func NormalizeAssetNamespace(host string) (string, bool) {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	h := strings.ToLower(strings.TrimRight(host, "."))
+	if isGBFAkamaiNormalized(h) || strings.HasPrefix(h, "game-a") {
+		return "gbf", true
+	}
+	return h, false
+}
+
+func isPassthroughHost(host string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	h := strings.ToLower(host)
+	return h == "ws.game.granbluefantasy.jp" || strings.HasPrefix(h, "ws.game.")
+}
+
+func isDomainOrSubdomainNormalized(host, domain string) bool {
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+func isDomainOrSubdomain(host, domain string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	h := strings.ToLower(strings.TrimRight(host, "."))
+	d := strings.ToLower(strings.TrimRight(domain, "."))
+	return isDomainOrSubdomainNormalized(h, d)
+}
+
+func isGBFAkamaiNormalized(h string) bool {
+	if !strings.HasSuffix(h, ".akamaized.net") {
+		return false
+	}
+	switch h {
+	case "prd-game-a-granbluefantasy.akamaized.net",
+		"prd-game-a1-granbluefantasy.akamaized.net",
+		"prd-game-a2-granbluefantasy.akamaized.net",
+		"prd-game-a3-granbluefantasy.akamaized.net",
+		"prd-game-a4-granbluefantasy.akamaized.net",
+		"prd-game-a5-granbluefantasy.akamaized.net",
+		"prd-game-a-granbluefantasy-steam.akamaized.net",
+		"prd-game-a1-granbluefantasy-steam.akamaized.net",
+		"prd-game-a2-granbluefantasy-steam.akamaized.net",
+		"prd-game-a3-granbluefantasy-steam.akamaized.net",
+		"prd-game-a4-granbluefantasy-steam.akamaized.net",
+		"prd-game-a5-granbluefantasy-steam.akamaized.net",
+		"prd-game-a-gbf.akamaized.net",
+		"prd-game-a1-gbf.akamaized.net",
+		"prd-game-a2-gbf.akamaized.net",
+		"prd-game-a3-gbf.akamaized.net",
+		"prd-game-a4-gbf.akamaized.net",
+		"prd-game-a5-gbf.akamaized.net":
+		return true
+	}
+	if isDomainOrSubdomainNormalized(h, "granbluefantasy.akamaized.net") ||
+		isDomainOrSubdomainNormalized(h, "gbf.akamaized.net") {
+		return true
+	}
+	// Strict prefix matching for future Akamai CDN shards
+	if strings.HasPrefix(h, "prd-game-a") && (strings.HasSuffix(h, "-granbluefantasy.akamaized.net") || strings.HasSuffix(h, "-gbf.akamaized.net")) {
+		return true
+	}
+	return false
+}
+
+func isGBFAkamaiHost(host string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	h := strings.ToLower(strings.TrimRight(host, "."))
+	return isGBFAkamaiNormalized(h)
+}
+
+func isGBFDomain(host string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	if isPassthroughHost(host) {
+		return false
+	}
+	if isGBFAkamaiHost(host) {
+		return true
+	}
+	return isDomainOrSubdomain(host, "granbluefantasy.jp") ||
+		isDomainOrSubdomain(host, "granbluefantasy.com") ||
+		isDomainOrSubdomain(host, "gbf.game.mbga.jp") ||
+		isDomainOrSubdomain(host, "connect.mobage.jp") ||
+		isDomainOrSubdomain(host, "sp.mbga.jp")
+}
+
+func isExternalGBFDomain(host string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return false
+	}
+	return isGBFDomain(host)
+}
+
+func isPrivateOrLocalHost(host string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	}
+	return host == "proxy" || host == "proxy.pac" || host == "ca.crt" || host == "gbf-proxy"
+}
+
+func isStaticTarget(host, path string) bool {
+	return isStaticTargetLower(host, strings.ToLower(path))
+}
+
+func isStaticTargetLower(host, pathLower string) bool {
+	if strings.IndexByte(host, ':') != -1 {
+		if hp, _, err := net.SplitHostPort(host); err == nil {
+			host = hp
+		}
+	}
+	host = strings.ToLower(strings.TrimRight(host, "."))
+	p := pathLower
+
+	// Dynamic prefixes are strictly non-static
+	dynamicPrefixes := []string{
+		"/rest/", "/quest/", "/party/", "/user/",
+		"/deck/", "/gacha/", "/casino/", "/present/",
+		"/mypage/", "/guild/", "/coopraid/", "/weapon/",
+		"/socket/", "/ob/",
+	}
+	for _, dp := range dynamicPrefixes {
+		if strings.HasPrefix(p, dp) {
+			return false
+		}
+	}
+
+	if isGBFAkamaiHost(host) || strings.HasPrefix(host, "game-a") {
+		return true
+	}
+
+	staticPrefixes := []string{
+		"/assets/", "/assets_en/", "/sound/", "/img/", "/css/", "/js/", "/font/",
+	}
+	for _, sp := range staticPrefixes {
+		if strings.HasPrefix(p, sp) {
+			return true
+		}
+	}
+
+	staticExts := []string{
+		".png", ".jpg", ".jpeg", ".webp", ".gif", ".css", ".js",
+		".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm",
+		".wasm", ".woff", ".woff2", ".ttf", ".otf", ".svg", ".ico",
+	}
+	clean, _, _ := strings.Cut(p, "?")
+	for _, ext := range staticExts {
+		if strings.HasSuffix(clean, ext) {
+			return true
+		}
+	}
+
+	return false
+}

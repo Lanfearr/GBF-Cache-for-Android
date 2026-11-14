@@ -1,0 +1,1388 @@
+package proxy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"gbf-proxy/cache"
+	"gbf-proxy/cert"
+	"gbf-proxy/config"
+	"gbf-proxy/telemetry"
+)
+
+func TestProxyRoutingRules(t *testing.T) {
+	// 1. isGBFDomain
+	gbfHosts := []string{
+		"game.granbluefantasy.jp",
+		"gbf.game.mbga.jp",
+		"connect.mobage.jp",
+		"prd-game-a-granbluefantasy.akamaized.net",
+	}
+	for _, h := range gbfHosts {
+		if !isGBFDomain(h) {
+			t.Errorf("host %s must be recognized as GBF domain", h)
+		}
+	}
+
+	nonGBFHosts := []string{
+		"example.com",
+		"google.com",
+		"twitter.com",
+		"localhost",
+		"127.0.0.1",
+	}
+	for _, h := range nonGBFHosts {
+		if isGBFDomain(h) {
+			t.Errorf("host %s must NOT be recognized as GBF domain", h)
+		}
+	}
+
+	// 2. isStaticTarget
+	staticTargets := []struct {
+		host string
+		path string
+	}{
+		{"prd-game-a-granbluefantasy.akamaized.net", "/assets/img/hero.png"},
+		{"game.granbluefantasy.jp", "/assets/1772717316/js/app.js"},
+		{"game.granbluefantasy.jp", "/assets_en/css/style.css"},
+		{"game.granbluefantasy.jp", "/sound/bgm.mp3"},
+	}
+	for _, target := range staticTargets {
+		if !isStaticTarget(target.host, target.path) {
+			t.Errorf("expected static target for %s%s", target.host, target.path)
+		}
+	}
+
+	dynamicTargets := []struct {
+		host string
+		path string
+	}{
+		{"game.granbluefantasy.jp", "/rest/multiraid/start.json"},
+		{"game.granbluefantasy.jp", "/quest/stage_list"},
+		{"game.granbluefantasy.jp", "/party/deck_info"},
+		{"game.granbluefantasy.jp", "/user/status"},
+		{"game.granbluefantasy.jp", "/ob/r"},
+	}
+	for _, target := range dynamicTargets {
+		if isStaticTarget(target.host, target.path) {
+			t.Errorf("dynamic API %s%s must NOT be treated as static", target.host, target.path)
+		}
+	}
+
+	// 3. isRetryableAPI
+	retryable := []string{
+		"/rest/multiraid/condition.json",
+		"/rest/quest/stage_list",
+		"/rest/party/deck_info",
+	}
+	for _, p := range retryable {
+		if !isRetryableAPI(p) {
+			t.Errorf("path %s must be in retryable whitelist", p)
+		}
+	}
+
+	nonRetryable := []string{
+		"/rest/multiraid/start.json",
+		"/rest/raid/ability_result.json",
+		"/rest/user/profile",
+		"/ob/r",
+	}
+	for _, p := range nonRetryable {
+		if isRetryableAPI(p) {
+			t.Errorf("path %s must NOT be in retryable whitelist", p)
+		}
+	}
+
+	// 4. matchETag
+	if !matchETag("\"abc\"", "\"abc\"") {
+		t.Error("identical ETags must match")
+	}
+	if !matchETag("W/\"abc\"", "\"abc\"") {
+		t.Error("weak ETag must match strong ETag with same value")
+	}
+	if !matchETag("\"abc\"", "W/\"abc\"") {
+		t.Error("strong ETag must match weak ETag with same value")
+	}
+	if matchETag("\"abc\"", "\"def\"") {
+		t.Error("different ETags must not match")
+	}
+	if !matchETag("*", "\"any-tag\"") {
+		t.Error("wildcard ETag must match any server ETag")
+	}
+	if !matchETag("\"tag1\", \"tag2\"", "\"tag2\"") {
+		t.Error("comma-separated ETags containing server ETag must match")
+	}
+	if !matchETag("W/\"tag1\", W/\"tag2\"", "\"tag2\"") {
+		t.Error("comma-separated weak ETags containing server ETag must match")
+	}
+	if matchETag("\"tag1\", \"tag2\"", "\"tag3\"") {
+		t.Error("comma-separated ETags not containing server ETag must not match")
+	}
+
+	// 5. isHopByHop
+	hopHeaders := []string{"connection", "keep-alive", "transfer-encoding", "upgrade", "te"}
+	for _, h := range hopHeaders {
+		if !isHopByHop(h) {
+			t.Errorf("header %s must be recognized as hop-by-hop", h)
+		}
+	}
+	if isHopByHop("content-type") || isHopByHop("etag") || isHopByHop("cookie") {
+		t.Error("standard headers must not be marked as hop-by-hop")
+	}
+
+	// 6. isPassthroughHost: ws.game.granbluefantasy.jp must be passthrough and NOT MITM'd
+	if !isPassthroughHost("ws.game.granbluefantasy.jp") {
+		t.Error("ws.game.granbluefantasy.jp must be recognized as passthrough host")
+	}
+	if isGBFDomain("ws.game.granbluefantasy.jp") {
+		t.Error("ws.game.granbluefantasy.jp must NOT be in MITM isGBFDomain")
+	}
+
+	// 7. isGBFAkamaiHost & isGBFDomain: only legitimate GBF domains are MITM'd
+	if !isGBFAkamaiHost("prd-game-a-granbluefantasy.akamaized.net") {
+		t.Error("prd-game-a-granbluefantasy.akamaized.net must be recognized as GBF Akamai host")
+	}
+	if !isGBFAkamaiHost("prd-game-a-granbluefantasy.akamaized.net:443") {
+		t.Error("Akamai host with port 443 must be recognized as GBF Akamai host")
+	}
+	if ns, isGBF := NormalizeAssetNamespace("prd-game-a-granbluefantasy.akamaized.net:80"); !isGBF || ns != "gbf" {
+		t.Errorf("NormalizeAssetNamespace with port expected ('gbf', true), got (%q, %v)", ns, isGBF)
+	}
+	if !isGBFAkamaiHost("prd-game-a1-granbluefantasy-steam.akamaized.net") {
+		t.Error("steam Akamai host must be recognized as GBF Akamai host")
+	}
+	if !isGBFAkamaiHost("prd-game-a-gbf.akamaized.net") {
+		t.Error("Android SkyLeap Akamai host prd-game-a-gbf.akamaized.net must be recognized as GBF Akamai host")
+	}
+	if !isGBFAkamaiHost("prd-game-a-gbf.akamaized.net:443") {
+		t.Error("Android SkyLeap Akamai host with port 443 must be recognized as GBF Akamai host")
+	}
+	if !isGBFAkamaiHost("prd-game-a1-gbf.akamaized.net") {
+		t.Error("Android SkyLeap Akamai shard prd-game-a1-gbf.akamaized.net must be recognized as GBF Akamai host")
+	}
+	if ns, isGBF := NormalizeAssetNamespace("prd-game-a-gbf.akamaized.net:443"); !isGBF || ns != "gbf" {
+		t.Errorf("NormalizeAssetNamespace for Android CDN expected ('gbf', true), got (%q, %v)", ns, isGBF)
+	}
+	if !isGBFDomain("prd-game-a-gbf.akamaized.net") {
+		t.Error("prd-game-a-gbf.akamaized.net must be recognized as GBF domain")
+	}
+	if !isStaticTarget("prd-game-a-gbf.akamaized.net", "/assets_en/img/sp/ui/icon.png") {
+		t.Error("asset on prd-game-a-gbf.akamaized.net must be recognized as static target")
+	}
+	if isGBFAkamaiHost("unrelated-tenant.akamaized.net") {
+		t.Error("unrelated Akamai tenants must NOT be recognized as GBF Akamai host")
+	}
+	if isGBFDomain("fakegranbluefantasy.jp") {
+		t.Error("fakegranbluefantasy.jp must NOT be recognized as GBF domain")
+	}
+	if !isGBFDomain("game.granbluefantasy.jp") {
+		t.Error("game.granbluefantasy.jp must be recognized as GBF domain")
+	}
+
+	// 8. isStaticTarget vs dynamic APIs
+	if !isStaticTarget("game.granbluefantasy.jp", "/sound/se/se_100.ogg") {
+		t.Error("/sound/se/se_100.ogg must be recognized as static")
+	}
+	if !isStaticTarget("game.granbluefantasy.jp", "/img/sp/ui/btn.png") {
+		t.Error("/img/sp/ui/btn.png must be recognized as static")
+	}
+	if isStaticTarget("game.granbluefantasy.jp", "/rest/multiraid/condition.json") {
+		t.Error("/rest/... must NOT be recognized as static")
+	}
+	if isStaticTarget("game.granbluefantasy.jp", "/present/receive.json") {
+		t.Error("/present/... must NOT be recognized as static")
+	}
+	if isStaticTarget("game.granbluefantasy.jp", "/guild/info.json") {
+		t.Error("/guild/... must NOT be recognized as static")
+	}
+}
+
+func TestPrefetchExtraction(t *testing.T) {
+	pe := &PrefetchEngine{}
+	sampleJS := `
+		var img1 = "assets/img/sp/quest/scene/character/body/3040001000.png";
+		var sound1 = '/sound/se/se_100.mp3';
+		var cjs = "sp/cjs/npc_3040001000.png";
+	`
+	refs := pe.extractAssetRefs("/assets/js/bundle.js", []byte(sampleJS), "prd-game-a-granbluefantasy.akamaized.net")
+	if len(refs) < 2 {
+		t.Fatalf("expected at least 2 extracted refs, got %d", len(refs))
+	}
+
+	// Twin CreateJS deduction test
+	twinManifestPath := "/assets/123456/js/model/manifest/npc_3040001000.js"
+	twinRefs := pe.extractAssetRefs(twinManifestPath, []byte("{}"), "prd-game-a-granbluefantasy.akamaized.net")
+	foundTwin := false
+	for _, r := range twinRefs {
+		if r[1] == "/assets/123456/js/cjs/npc_3040001000.js" {
+			foundTwin = true
+			break
+		}
+	}
+	if !foundTwin {
+		t.Error("expected twin CreateJS script to be deduced from model manifest")
+	}
+
+	// English asset prefix test
+	enRefs := pe.extractAssetRefs("/assets_en/123456/js/manifest.js", []byte(`var s = "sp/cjs/tex.png";`), "prd-game-a-granbluefantasy.akamaized.net")
+	foundEn := false
+	for _, r := range enRefs {
+		if r[1] == "/assets_en/img/sp/cjs/tex.png" {
+			foundEn = true
+			break
+		}
+	}
+	if !foundEn {
+		t.Errorf("expected /assets_en/img prefix for english assets, got: %v", enRefs)
+	}
+
+	prioJS := getPrefetchPriority("/assets/js/bundle.js")
+	if prioJS != 1 {
+		t.Errorf("expected prio 1 for JS, got %d", prioJS)
+	}
+	prioImg := getPrefetchPriority("/assets/img/hero.png")
+	if prioImg != 2 {
+		t.Errorf("expected prio 2 for PNG, got %d", prioImg)
+	}
+	prioSound := getPrefetchPriority("/sound/bgm.mp3")
+	if prioSound != 3 {
+		t.Errorf("expected prio 3 for MP3, got %d", prioSound)
+	}
+}
+
+func TestSplitHostPortElimination_ZeroAlloc(t *testing.T) {
+	plainHost := "prd-game-a-granbluefantasy.akamaized.net"
+	plainPath := "/assets/img/sp/quest/scene/character/body/3040001000.png"
+
+	// 1. isStaticTargetLower on plain host should not allocate (0 allocs)
+	allocs := testing.AllocsPerRun(1000, func() {
+		if !isStaticTargetLower(plainHost, plainPath) {
+			t.Fatal("expected static target")
+		}
+	})
+	if allocs > 0 {
+		t.Errorf("isStaticTargetLower allocated %v allocs/op on plain host, want 0", allocs)
+	}
+
+	// 2. isGBFDomain on plain host (Akamai CDN) should not allocate (0 allocs)
+	allocsGBF := testing.AllocsPerRun(1000, func() {
+		if !isGBFDomain(plainHost) {
+			t.Fatal("expected GBF domain")
+		}
+	})
+	if allocsGBF > 0 {
+		t.Errorf("isGBFDomain allocated %v allocs/op on plain host, want 0", allocsGBF)
+	}
+
+	// 2b. isGBFDomain on non-Akamai GBF domain (e.g. game.granbluefantasy.jp) should also have 0 allocs
+	allocsGame := testing.AllocsPerRun(1000, func() {
+		if !isGBFDomain("game.granbluefantasy.jp") {
+			t.Fatal("expected game.granbluefantasy.jp to be GBF domain")
+		}
+	})
+	if allocsGame > 0 {
+		t.Errorf("isGBFDomain allocated %v allocs/op on game.granbluefantasy.jp, want 0", allocsGame)
+	}
+
+	// 3. isExternalGBFDomain on plain host should match and not allocate
+	allocsExt := testing.AllocsPerRun(1000, func() {
+		if !isExternalGBFDomain(plainHost) {
+			t.Fatal("expected external GBF domain")
+		}
+	})
+	if allocsExt > 0 {
+		t.Errorf("isExternalGBFDomain allocated %v allocs/op on plain host, want 0", allocsExt)
+	}
+
+	// 4. Verify functionality with explicit port
+	hostWithPort := "prd-game-a-granbluefantasy.akamaized.net:443"
+	if !isStaticTargetLower(hostWithPort, plainPath) {
+		t.Errorf("isStaticTargetLower failed on host with port: %s", hostWithPort)
+	}
+	if !isGBFDomain(hostWithPort) {
+		t.Errorf("isGBFDomain failed on host with port: %s", hostWithPort)
+	}
+	if !isExternalGBFDomain(hostWithPort) {
+		t.Errorf("isExternalGBFDomain failed on host with port: %s", hostWithPort)
+	}
+
+	// 5. isPrivateOrLocalHost with and without port
+	if !isPrivateOrLocalHost("127.0.0.1") {
+		t.Error("isPrivateOrLocalHost failed for 127.0.0.1")
+	}
+	if !isPrivateOrLocalHost("127.0.0.1:8124") {
+		t.Error("isPrivateOrLocalHost failed for 127.0.0.1:8124")
+	}
+	if isPrivateOrLocalHost(plainHost) {
+		t.Errorf("isPrivateOrLocalHost returned true for public host %s", plainHost)
+	}
+
+	// 6. extractActualTarget zero allocation on plain host
+	reqWithoutPort, _ := http.NewRequest(http.MethodGet, "http://gbf-proxy/ca.crt", nil)
+	allocsTarget := testing.AllocsPerRun(1000, func() {
+		h, p := extractActualTarget(reqWithoutPort)
+		if h != "gbf-proxy" || p != "" {
+			t.Fatalf("unexpected extractActualTarget result: %s, %s", h, p)
+		}
+	})
+	if allocsTarget > 0 {
+		t.Errorf("extractActualTarget allocated %v allocs/op on plain host, want 0", allocsTarget)
+	}
+
+	// 7. prefetch RecordActiveGBFHost zero allocation on plain host
+	pe := &PrefetchEngine{}
+	allocsRecord := testing.AllocsPerRun(1000, func() {
+		pe.RecordActiveGBFHost(plainHost)
+	})
+	if allocsRecord > 0 {
+		t.Errorf("RecordActiveGBFHost allocated %v allocs/op on plain host, want 0", allocsRecord)
+	}
+
+	// 8. Edge cases and other domain checks (zero alloc and semantic parity)
+	otherGBFDomains := []string{
+		"granbluefantasy.jp",
+		"granbluefantasy.com",
+		"gbf.game.mbga.jp",
+		"connect.mobage.jp",
+		"sp.mbga.jp",
+	}
+	for _, d := range otherGBFDomains {
+		allocs := testing.AllocsPerRun(1000, func() {
+			if !isGBFDomain(d) {
+				t.Fatalf("expected %s to be recognized as GBF domain", d)
+			}
+		})
+		if allocs > 0 {
+			t.Errorf("isGBFDomain allocated %v allocs/op on %s, want 0", allocs, d)
+		}
+	}
+
+	// Non-GBF and passthrough domains: should be false and 0 allocs
+	nonGBF := []string{
+		"example.com",
+		"google.com",
+		"ws.game.granbluefantasy.jp",
+		"fakegranbluefantasy.jp",
+	}
+	for _, d := range nonGBF {
+		allocs := testing.AllocsPerRun(1000, func() {
+			if isGBFDomain(d) {
+				t.Fatalf("expected %s to NOT be GBF domain", d)
+			}
+		})
+		if allocs > 0 {
+			t.Errorf("isGBFDomain allocated %v allocs/op on non-GBF host %s, want 0", allocs, d)
+		}
+	}
+
+	// Dynamic API paths on static hosts: should be false and 0 allocs
+	allocsDyn := testing.AllocsPerRun(1000, func() {
+		if isStaticTargetLower(plainHost, "/rest/user/status") {
+			t.Fatal("dynamic prefix should not be static target")
+		}
+	})
+	if allocsDyn > 0 {
+		t.Errorf("isStaticTargetLower allocated %v allocs/op on dynamic path, want 0", allocsDyn)
+	}
+
+	// Semantic parity on edge-case host formats (empty, trailing dot, IPv6, malformed)
+	nonStaticPath := "/custom/asset.dat"
+	edgeHosts := []struct {
+		host      string
+		isGBF     bool
+		isStatic  bool
+		isPrivate bool
+	}{
+		{"", false, false, true},
+		{":80", false, false, true},
+		{"host:", false, false, false},
+		{"[::1]", false, false, true},
+		{"[::1]:8124", false, false, true},
+		{"::1", false, false, true},
+		{"prd-game-a-granbluefantasy.akamaized.net.", true, true, false},
+		{"prd-game-a-granbluefantasy.akamaized.net.:443", true, true, false},
+		{"game.granbluefantasy.jp.", true, false, false},
+	}
+	for _, tc := range edgeHosts {
+		if got := isGBFDomain(tc.host); got != tc.isGBF {
+			t.Errorf("isGBFDomain(%q) = %v, want %v", tc.host, got, tc.isGBF)
+		}
+		if got := isStaticTargetLower(tc.host, nonStaticPath); got != tc.isStatic {
+			t.Errorf("isStaticTargetLower(%q, %q) = %v, want %v", tc.host, nonStaticPath, got, tc.isStatic)
+		}
+		if got := isPrivateOrLocalHost(tc.host); got != tc.isPrivate {
+			t.Errorf("isPrivateOrLocalHost(%q) = %v, want %v", tc.host, got, tc.isPrivate)
+		}
+	}
+}
+
+func TestProxyServerLifecycleRestart(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "proxy-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = 0 // random free port allocated by OS
+		c.CacheDir = tmpDir
+	})
+
+	certMgr, err := cert.NewManager(filepath.Join(tmpDir, "certs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cacheMgr := cache.NewManager(tmpDir, 16)
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	// A stopped proxy must terminate already-accepted client connections, not
+	// merely stop accepting new connections. Otherwise HTTP Keep-Alive / CONNECT
+	// sessions could continue forwarding traffic after the UI says "stopped".
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start for active-connection stop test failed: %v", err)
+	}
+	clientConn, err := net.Dial("tcp", srv.ListenerAddr())
+	if err != nil {
+		t.Fatalf("failed to connect test client: %v", err)
+	}
+	defer clientConn.Close()
+
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		srv.connMu.Lock()
+		activeCount := len(srv.activeConns)
+		srv.connMu.Unlock()
+		if activeCount > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("test client connection was never tracked as active")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	srv.Stop()
+	clientConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	var readBuf [1]byte
+	if _, readErr := clientConn.Read(readBuf[:]); readErr == nil {
+		t.Fatal("expected client connection to be closed after proxy stop")
+	}
+
+	// Cycle 1: Start -> Stop
+	if err := srv.Start(); err != nil {
+		t.Fatalf("first start failed: %v", err)
+	}
+	if !srv.IsRunning() {
+		t.Fatal("expected running true")
+	}
+	srv.Stop()
+	if srv.IsRunning() {
+		t.Fatal("expected running false after stop")
+	}
+
+	// Idempotent Stop (must not panic)
+	srv.Stop()
+
+	// Cycle 2: Restart -> Stop
+	if err := srv.Start(); err != nil {
+		t.Fatalf("second start failed: %v", err)
+	}
+	if !srv.IsRunning() {
+		t.Fatal("expected running true on second start")
+	}
+	if srv.prefetch == nil || srv.prefetch.IsStopped() {
+		t.Fatal("expected prefetch engine to be running after restart")
+	}
+	srv.Stop()
+	if !srv.prefetch.IsStopped() {
+		t.Fatal("expected prefetch engine to be stopped after stop")
+	}
+}
+
+func TestPrefetchInflightRelease(t *testing.T) {
+	srv := &ProxyServer{
+		stats: telemetry.NewStats(),
+	}
+	pe := newPrefetchEngine(srv)
+	defer pe.Stop()
+
+	key := "test-host/assets/test.png"
+	pe.inflightMu.Lock()
+	pe.inflight[key] = struct{}{}
+	pe.inflightMu.Unlock()
+
+	pe.inflightMu.Lock()
+	_, ok := pe.inflight[key]
+	pe.inflightMu.Unlock()
+	if !ok {
+		t.Fatal("expected key in inflight")
+	}
+
+	pe.removeInflight(key)
+
+	pe.inflightMu.Lock()
+	_, ok = pe.inflight[key]
+	pe.inflightMu.Unlock()
+	if ok {
+		t.Fatal("expected key to be removed from inflight")
+	}
+}
+
+func TestWindowsPathValidation(t *testing.T) {
+	validPaths := []string{
+		"windows_skin.png",
+		"/assets/img/windows_character.png",
+		"/sound/windows_bgm.mp3",
+		"c:\\windows_skin.png",
+		"d:\\assets\\windows_theme.css",
+	}
+	for _, p := range validPaths {
+		if isBlockedWindowsPath(p) {
+			t.Errorf("path %q should NOT be blocked as windows system path", p)
+		}
+	}
+
+	blockedPaths := []string{
+		"/windows/system32/calc.exe",
+		"\\windows\\win.ini",
+		"windows/win.ini",
+		"windows",
+		"/windows",
+		"\\windows",
+		"c:\\windows",
+		"c:\\windows\\system32",
+		"c:/windows/system32",
+		"/foo/windows/bar",
+	}
+	for _, p := range blockedPaths {
+		if !isBlockedWindowsPath(p) {
+			t.Errorf("path %q SHOULD be blocked as windows system path", p)
+		}
+	}
+}
+
+type dummyConn struct {
+	net.Conn
+	writeBuf bytes.Buffer
+}
+
+func (d *dummyConn) Write(b []byte) (int, error) {
+	return d.writeBuf.Write(b)
+}
+
+func (d *dummyConn) Close() error {
+	return nil
+}
+
+func (d *dummyConn) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8124}
+}
+
+func (d *dummyConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321}
+}
+
+func TestHandlePlainHTTP_DirectLocalAndPAC(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		t.Fatalf("failed to create cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	// 1. Direct local request for /ca.crt
+	conn1 := &dummyConn{}
+	req1 := &http.Request{
+		Method: http.MethodGet,
+		Host:   "127.0.0.1:8124",
+		URL:    &url.URL{Path: "/ca.crt"},
+	}
+	srv.handlePlainHTTP(conn1, req1)
+	if !strings.Contains(conn1.writeBuf.String(), "200 OK") || !strings.Contains(conn1.writeBuf.String(), "application/x-x509-ca-cert") {
+		t.Errorf("expected 200 OK with ca cert for direct local request, got %s", conn1.writeBuf.String())
+	}
+
+	// 2. Proxied request for http://prd-game-a-granbluefantasy.akamaized.net/assets/ca.crt (URL.IsAbs() = true)
+	// Must NOT be intercepted as direct local CA cert
+	cacheMgr.SaveWithNamespace("gbf", "assets/ca.crt", map[string]string{"content-type": "text/plain"}, []byte("game-asset-bytes"))
+	conn2 := &dummyConn{}
+	req2 := &http.Request{
+		Method: http.MethodGet,
+		Host:   "prd-game-a-granbluefantasy.akamaized.net",
+		URL:    &url.URL{Scheme: "http", Host: "prd-game-a-granbluefantasy.akamaized.net", Path: "/assets/ca.crt"},
+	}
+	srv.handlePlainHTTP(conn2, req2)
+	// Should NOT return application/x-x509-ca-cert
+	if strings.Contains(conn2.writeBuf.String(), "application/x-x509-ca-cert") || strings.Contains(conn2.writeBuf.String(), "gbf_ca.crt") {
+		t.Error("external proxied request for /assets/ca.crt must NOT return proxy root CA cert")
+	}
+	if !strings.Contains(conn2.writeBuf.String(), "game-asset-bytes") {
+		t.Errorf("expected cached game asset, got %s", conn2.writeBuf.String())
+	}
+
+	// 3. An external host must not be able to claim internal proxy endpoints.
+	// Use a loopback HTTP proxy so this regression test remains fully local.
+	upstreamProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("upstream-resource"))
+	}))
+	defer upstreamProxy.Close()
+	cfgMgr.Update(func(c *config.Config) {
+		c.AllowLAN = true
+		c.UpstreamProxy = upstreamProxy.URL
+	})
+	connExternal := &dummyConn{}
+	reqExternal := &http.Request{
+		Method: http.MethodGet,
+		Host:   "example.com:8124",
+		URL:    &url.URL{Scheme: "http", Host: "example.com:8124", Path: "/ca.crt"},
+	}
+	srv.handlePlainHTTP(connExternal, reqExternal)
+	if strings.Contains(connExternal.writeBuf.String(), "application/x-x509-ca-cert") ||
+		strings.Contains(connExternal.writeBuf.String(), "gbf_ca.crt") {
+		t.Fatal("external /ca.crt must never return the proxy's root CA")
+	}
+	if !strings.Contains(connExternal.writeBuf.String(), "upstream-resource") {
+		t.Fatalf("external /ca.crt should be forwarded, got %s", connExternal.writeBuf.String())
+	}
+
+	// 4. PAC extraction with port omitted
+	cfgMgr.Update(func(c *config.Config) {
+		c.AllowLAN = true
+	})
+	targetPAC := "127.0.0.1"
+	if lan := config.GetLANIP(); lan != "" {
+		targetPAC = lan
+	}
+	conn3 := &dummyConn{}
+	req3 := &http.Request{
+		Method: http.MethodGet,
+		Host:   targetPAC, // Port omitted!
+		URL:    &url.URL{Path: "/proxy.pac"},
+	}
+	srv.handlePlainHTTP(conn3, req3)
+	expectedAddr := targetPAC + ":8124"
+	if !strings.Contains(conn3.writeBuf.String(), expectedAddr) {
+		t.Errorf("expected PAC script to contain host %s, got %s", expectedAddr, conn3.writeBuf.String())
+	}
+
+	// 5. Direct local IPv6 request for /ca.crt with Host: [::1] (port omitted)
+	conn4 := &dummyConn{}
+	req4 := &http.Request{
+		Method: http.MethodGet,
+		Host:   "[::1]",
+		URL:    &url.URL{Path: "/ca.crt"},
+	}
+	srv.handlePlainHTTP(conn4, req4)
+	if !strings.Contains(conn4.writeBuf.String(), "200 OK") || !strings.Contains(conn4.writeBuf.String(), "application/x-x509-ca-cert") {
+		t.Errorf("expected 200 OK with ca cert for IPv6 [::1] direct local request, got %s", conn4.writeBuf.String())
+	}
+}
+
+func TestConditionalAsset304AndCacheControl(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	certMgr, _ := cert.NewManager(filepath.Join(tempDir, "certs"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	// Mock upstream HTTPS server
+	upstreamHitCount := 0
+	upstreamReceivedConditional := false
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHitCount++
+		if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+			upstreamReceivedConditional = true
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", "\"cdn-etag-999\"")
+		w.Header().Set("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"))
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	srv.assetClient.Store(ts.Client())
+
+	// Client sends conditional request (If-None-Match matching CDN ETag) on cache miss
+	req, _ := http.NewRequest(http.MethodGet, "https://"+u.Host+"/assets/test_conditional.png", nil)
+	req.Header.Set("If-None-Match", "\"cdn-etag-999\"")
+
+	var buf bytes.Buffer
+	srv.handleStaticAsset(&buf, req, u.Host)
+
+	// 1. Upstream must NOT have received conditional headers
+	if upstreamReceivedConditional {
+		t.Error("expected upstream request to have client conditional headers stripped")
+	}
+
+	// 2. Client response must be 304 Not Modified
+	respStr := buf.String()
+	if !strings.HasPrefix(respStr, "HTTP/1.1 304 Not Modified") {
+		t.Fatalf("expected HTTP/1.1 304 Not Modified, got: %s", respStr)
+	}
+
+	// 3. Response must include Cache-Control per RFC 7234
+	if !strings.Contains(respStr, "Cache-Control:") {
+		t.Errorf("expected 304 response to include Cache-Control header per RFC 7234, got: %s", respStr)
+	}
+	if !strings.Contains(respStr, "ETag: \"cdn-etag-999\"") {
+		t.Errorf("expected 304 response to include ETag, got: %s", respStr)
+	}
+
+	// 4. Client sends standard unconditional GET: must return 200 OK with ETag and Last-Modified
+	req2, _ := http.NewRequest(http.MethodGet, "https://"+u.Host+"/assets/test_conditional.png", nil)
+	var buf2 bytes.Buffer
+	srv.handleStaticAsset(&buf2, req2, u.Host)
+	resp2Str := buf2.String()
+	if !strings.HasPrefix(resp2Str, "HTTP/1.1 200 OK") {
+		t.Fatalf("expected HTTP/1.1 200 OK, got: %s", resp2Str)
+	}
+	if !strings.Contains(resp2Str, "Last-Modified: Wed, 21 Oct 2026 07:28:00 GMT") {
+		t.Errorf("expected 200 OK response to include Last-Modified, got: %s", resp2Str)
+	}
+}
+
+func TestHandleStaticAsset_SingleFlightResilience(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	certMgr, _ := cert.NewManager(filepath.Join(tempDir, "certs"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(60 * time.Millisecond) // Ensure flight is in progress
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"))
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	srv.assetClient.Store(ts.Client())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client 1: Context cancels early after 10ms
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel1()
+	req1, _ := http.NewRequestWithContext(ctx1, http.MethodGet, "https://"+u.Host+"/assets/shared_flight.png", nil)
+	var buf1 bytes.Buffer
+
+	// Client 2: Context remains active
+	req2, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+u.Host+"/assets/shared_flight.png", nil)
+	var buf2 bytes.Buffer
+
+	go func() {
+		defer wg.Done()
+		srv.handleStaticAsset(&buf1, req1, u.Host)
+	}()
+
+	// Stagger slightly so Client 1 starts the flight
+	time.Sleep(5 * time.Millisecond)
+
+	go func() {
+		defer wg.Done()
+		srv.handleStaticAsset(&buf2, req2, u.Host)
+	}()
+
+	wg.Wait()
+
+	// Client 2 MUST receive 200 OK, never 502 Bad Gateway
+	resp2Str := buf2.String()
+	if !strings.HasPrefix(resp2Str, "HTTP/1.1 200 OK") {
+		t.Fatalf("expected Client 2 to receive HTTP/1.1 200 OK despite Client 1 context abort, got: %s", resp2Str)
+	}
+}
+
+func TestHandleStaticAsset_FollowerContextCancellation(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	certMgr, _ := cert.NewManager(filepath.Join(tempDir, "certs"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond) // Slow upstream
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\nfollower_cancel_test"))
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	srv.assetClient.Store(ts.Client())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Client 1 (Leader): Context remains active
+	req1, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+u.Host+"/assets/follower_cancel.png", nil)
+	var buf1 bytes.Buffer
+
+	// Client 2 (Follower): Context cancels after 15ms
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel2()
+	req2, _ := http.NewRequestWithContext(ctx2, http.MethodGet, "https://"+u.Host+"/assets/follower_cancel.png", nil)
+	var buf2 bytes.Buffer
+
+	go func() {
+		defer wg.Done()
+		srv.handleStaticAsset(&buf1, req1, u.Host)
+	}()
+
+	// Stagger slightly so Client 1 is definitely the leader
+	time.Sleep(5 * time.Millisecond)
+
+	followerDone := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		srv.handleStaticAsset(&buf2, req2, u.Host)
+		close(followerDone)
+	}()
+
+	// Follower must unblock within ~35ms, long before the 80ms upstream finishes
+	select {
+	case <-followerDone:
+		// Follower unblocked promptly on context cancellation
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("follower did not unblock on context cancellation, blocked on singleflight leader")
+	}
+
+	wg.Wait()
+
+	// Client 1 MUST still succeed with 200 OK
+	resp1Str := buf1.String()
+	if !strings.HasPrefix(resp1Str, "HTTP/1.1 200 OK") {
+		t.Fatalf("expected Client 1 to receive HTTP/1.1 200 OK, got: %s", resp1Str)
+	}
+}
+
+func TestDynamicAPI_ClientContextCancellation(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	certMgr, _ := cert.NewManager(filepath.Join(tempDir, "certs"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+
+	upstreamGotCancel := make(chan bool, 1)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			upstreamGotCancel <- true
+		case <-time.After(300 * time.Millisecond):
+			upstreamGotCancel <- false
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	srv.apiClient.Store(ts.Client())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+u.Host+"/rest/multiraid/condition.json", nil)
+	var buf bytes.Buffer
+	srv.handleDynamicAPI(&buf, req, u.Host)
+
+	select {
+	case cancelled := <-upstreamGotCancel:
+		if !cancelled {
+			t.Error("expected upstream request to receive context cancellation from client")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for upstream handler to observe context cancellation")
+	}
+}
+
+func TestAndroidSkyLeapCDN_Matching(t *testing.T) {
+	testHosts := []string{
+		"prd-game-a-gbf.akamaized.net",
+		"prd-game-a-gbf.akamaized.net:443",
+		"prd-game-a1-gbf.akamaized.net",
+		"prd-game-a2-gbf.akamaized.net",
+		"prd-game-a3-gbf.akamaized.net",
+		"prd-game-a4-gbf.akamaized.net",
+		"prd-game-a5-gbf.akamaized.net",
+	}
+
+	for _, host := range testHosts {
+		if !isGBFAkamaiHost(host) {
+			t.Errorf("host %q must be recognized by isGBFAkamaiHost", host)
+		}
+		if !isGBFDomain(host) {
+			t.Errorf("host %q must be recognized by isGBFDomain", host)
+		}
+		ns, isGBF := NormalizeAssetNamespace(host)
+		if !isGBF || ns != "gbf" {
+			t.Errorf("host %q expected NormalizeAssetNamespace ('gbf', true), got (%q, %v)", host, ns, isGBF)
+		}
+	}
+
+	staticPaths := []string{
+		"/assets_en/img/sp/ui/icon.png",
+		"/assets_en/css/common.css",
+		"/assets_en/js/bundle.js",
+		"/sound/se/se_100.ogg",
+		"/assets/font/font.woff2",
+	}
+
+	for _, path := range staticPaths {
+		if !isStaticTarget("prd-game-a-gbf.akamaized.net", path) {
+			t.Errorf("static path %q on prd-game-a-gbf.akamaized.net must be recognized as static target", path)
+		}
+	}
+
+	dynamicPaths := []string{
+		"/rest/user/status",
+		"/quest/index",
+		"/party/deck",
+		"/ob/r",
+	}
+
+	for _, path := range dynamicPaths {
+		if isStaticTarget("prd-game-a-gbf.akamaized.net", path) {
+			t.Errorf("dynamic path %q on prd-game-a-gbf.akamaized.net must NOT be recognized as static target", path)
+		}
+	}
+}
+
+func TestProxyRedirectTransparency(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tmpDir, "config.json"))
+	cfgMgr.Update(func(c *config.Config) {
+		c.DirectMode = true
+		c.VerifyUpstreamTLS = false
+		c.CacheDir = tmpDir
+	})
+
+	certMgr, err := cert.NewManager(filepath.Join(tmpDir, "certs"))
+	if err != nil {
+		t.Fatalf("failed to init cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tmpDir, 16)
+	stats := telemetry.NewStats()
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	activeCfg := cfgMgr.Get()
+	srv.updateClients(&activeCfg)
+
+	// Upstream TLS server that returns 302 Found redirect
+	redirectCount := 0
+	targetHit := false
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			redirectCount++
+			http.Redirect(w, r, "/target", http.StatusFound)
+			return
+		}
+		if r.URL.Path == "/target" {
+			targetHit = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("target page"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+
+	req, _ := http.NewRequest(http.MethodGet, "https://"+u.Host+"/redirect", nil)
+	var buf bytes.Buffer
+	srv.handleDynamicAPI(&buf, req, u.Host)
+
+	// Verify that the proxy returned 302 Found directly to the client
+	respStr := buf.String()
+	if !strings.Contains(respStr, "302 Found") && !strings.Contains(respStr, "HTTP/1.1 302") {
+		t.Errorf("expected proxy to return 302 Found directly, got: %s", respStr)
+	}
+	if !strings.Contains(respStr, "Location: /target") && !strings.Contains(respStr, "Location: "+ts.URL+"/target") {
+		t.Errorf("expected proxy to preserve Location header in 302 response, got: %s", respStr)
+	}
+	if targetHit {
+		t.Error("apiClient must NOT auto-follow redirect to /target; it must be returned as-is to the client")
+	}
+}
+
+var reVersioned = regexp.MustCompile(`/(?:assets(?:_(?:en|jp))?)/\d+/|/\d{8,}/`)
+
+func TestIsVersionedAssetPathEquivalence(t *testing.T) {
+	testCases := []string{
+		"/assets/123456/sound/se.mp3",
+		"/assets_en/999999/img/sp/quest.png",
+		"/assets_jp/1111/cjs/cjs.js",
+		"/assets/1/app.js",
+		"/assets_en/2/app.js",
+		"/assets_jp/3/app.js",
+		"/12345678/manifest.json",
+		"/123456789/data.bin",
+		"/game/12345678/asset.js",
+		"/sub/path/12345678/file.png",
+		"/assets/img/sp/quest.png",
+		"/assets/js/app.js",
+		"/assets_en/img/banner.png",
+		"/assets_jp/sound/bgm.mp3",
+		"/1234567/too_short.js",
+		"/assets/abc/not_digits.js",
+		"/assets_en/abc/not_digits.js",
+		"/assets/12345",
+		"/assets_en/12345",
+		"/assets_jp/12345",
+		"",
+		"/",
+		"/assets/",
+		"/12345678",
+		"/other/path/without/version.js",
+		"/assets/12345/sub/67890/deep.png",
+	}
+
+	for _, tc := range testCases {
+		expected := reVersioned.MatchString(tc)
+		actual := isVersionedAssetPath(tc)
+		if expected != actual {
+			t.Errorf("isVersionedAssetPath(%q) = %v, expected %v", tc, actual, expected)
+		}
+	}
+}
+
+func TestIsVersionedAssetPathCombinatorial(t *testing.T) {
+	prefixes := []string{
+		"", "/", "/assets/", "/assets_en/", "/assets_jp/", "/other/", "/12345678/", "/1234567/",
+		"/assets", "/assets_en", "/assets_jp", "assets/", "assets_en/", "assets_jp/",
+		"/nested/assets/", "/nested/assets_en/", "/nested/assets_jp/",
+	}
+	midSegments := []string{
+		"", "1", "12", "1234567", "12345678", "123456789", "abc", "123abc", "abc123", "0",
+		"12345678/", "1234567/", "9999999999",
+	}
+	suffixes := []string{
+		"", "/", "/file.js", "/nested/path/sound.mp3", ".js", "/12345678/file.png",
+		"/0/file.png", "/a/b/c",
+	}
+
+	for _, p := range prefixes {
+		for _, m := range midSegments {
+			for _, s := range suffixes {
+				candidate := p + m + s
+				expected := reVersioned.MatchString(candidate)
+				actual := isVersionedAssetPath(candidate)
+				if expected != actual {
+					t.Fatalf("mismatch for candidate %q: regex=%v, func=%v", candidate, expected, actual)
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkRangeDiskHit_3MiBFile_64BSlice(b *testing.B) {
+	tempDir := b.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		b.Fatalf("failed to create cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tempDir, 64)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+	defer stats.Close()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	defer srv.Stop()
+
+	const diskSize = 3 * 1024 * 1024
+	payload := make([]byte, diskSize)
+	copy(payload, []byte("\x89PNG\r\n\x1a\n"))
+	for i := 8; i < len(payload); i++ {
+		payload[i] = byte(i % 251)
+	}
+	assetPath := "/assets/img/sp/bench_range_3mb.png"
+	if !cacheMgr.SaveWithNamespace("gbf", assetPath, map[string]string{
+		"content-type": "image/png",
+		"etag":         `"bench-range-etag"`,
+	}, payload) {
+		b.Fatalf("failed to save disk asset")
+	}
+	cacheMgr.ClearRAM()
+
+	targetHost := "prd-game-a-granbluefantasy.akamaized.net"
+	req, _ := http.NewRequest(http.MethodGet, "https://"+targetHost+assetPath, nil)
+	req.Header.Set("Range", "bytes=1024-1087")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		srv.handleDecryptedRequest(io.Discard, req, targetHost)
+	}
+}
+
+func BenchmarkDynamicAPIForward(b *testing.B) {
+	tempDir := b.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		b.Fatalf("failed to create cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+	defer stats.Close()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	defer srv.Stop()
+
+	respBody := []byte(`{"result":"ok","ap":99}`)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "23")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBody)
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	tr := ts.Client().Transport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return net.Dial("tcp", u.Host)
+	}
+	tr.TLSClientConfig.InsecureSkipVerify = true
+	tr.MaxIdleConns = 16
+	tr.MaxIdleConnsPerHost = 16
+	tr.IdleConnTimeout = 30 * time.Second
+	wrapAPITransportSingleAttempt(tr)
+	srv.apiClient.Store(&http.Client{Transport: tr})
+
+	apiHost := "game.granbluefantasy.jp"
+	postPayload := []byte(`{"ability_id":1}`)
+
+	// Warm connection pool
+	warmReq, _ := http.NewRequest(http.MethodPost, "https://"+apiHost+"/rest/raid/ability_result.json", bytes.NewReader(postPayload))
+	srv.handleDynamicAPI(io.Discard, warmReq, apiHost)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req, _ := http.NewRequest(http.MethodPost, "https://"+apiHost+"/rest/raid/ability_result.json", bytes.NewReader(postPayload))
+		srv.handleDynamicAPI(io.Discard, req, apiHost)
+	}
+}
+
+func TestProxyHostsPathAndNamespaceIsolation(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		t.Fatalf("failed to create cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tempDir, 32)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+	defer stats.Close()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	defer srv.Stop()
+
+	var hitsMu sync.Mutex
+	var upstreamHits int
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsMu.Lock()
+		upstreamHits++
+		hitsMu.Unlock()
+		body := []byte("console.log('host=" + r.Host + ",path=" + r.URL.Path + "');")
+		w.Header().Set("Content-Type", "application/javascript")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	tr := ts.Client().Transport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return net.Dial("tcp", u.Host)
+	}
+	tr.TLSClientConfig.InsecureSkipVerify = true
+	srv.assetClient.Store(&http.Client{Transport: tr})
+
+	doAssetReq := func(host, reqPath string) string {
+		req, _ := http.NewRequest(http.MethodGet, "https://"+host+reqPath, nil)
+		req.Host = host
+		var buf bytes.Buffer
+		srv.handleDecryptedRequest(&buf, req, host)
+		resp, err := http.ReadResponse(bufio.NewReader(&buf), req)
+		if err != nil {
+			t.Fatalf("ReadResponse for %s%s failed: %v", host, reqPath, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+
+	// 1. GBF host requesting /hosts/cdn-b.example.com/assets/100/js/app.js
+	gbfHost := "prd-game-a-granbluefantasy.akamaized.net"
+	got1 := doAssetReq(gbfHost, "/hosts/cdn-b.example.com/assets/100/js/app.js")
+	want1 := "console.log('host=" + gbfHost + ",path=/hosts/cdn-b.example.com/assets/100/js/app.js');"
+	if got1 != want1 {
+		t.Fatalf("req 1 body mismatch: got %q, want %q", got1, want1)
+	}
+
+	// 2. External host cdn-a.example.com requesting /hosts/cdn-b.example.com/assets/100/js/app.js
+	got2 := doAssetReq("cdn-a.example.com", "/hosts/cdn-b.example.com/assets/100/js/app.js")
+	want2 := "console.log('host=cdn-a.example.com,path=/hosts/cdn-b.example.com/assets/100/js/app.js');"
+	if got2 != want2 {
+		t.Fatalf("req 2 body mismatch: got %q, want %q", got2, want2)
+	}
+
+	// 3. External host cdn-b.example.com requesting /assets/100/js/app.js
+	got3 := doAssetReq("cdn-b.example.com", "/assets/100/js/app.js")
+	want3 := "console.log('host=cdn-b.example.com,path=/assets/100/js/app.js');"
+	if got3 != want3 {
+		t.Fatalf("req 3 body mismatch: got %q, want %q", got3, want3)
+	}
+
+	hitsMu.Lock()
+	hits := upstreamHits
+	hitsMu.Unlock()
+	if hits != 3 {
+		t.Fatalf("expected 3 distinct upstream fetches, got %d", hits)
+	}
+}
+
+func TestPlainHTTPHostCaseNormalizationAndStaticTarget(t *testing.T) {
+	// 1. Verify isStaticTarget / isStaticTargetLower with uppercase CDN hosts
+	if !isStaticTarget("GAME-A.GRANBLUEFANTASY.JP", "/custom/unknown_ext_resource") {
+		t.Fatal("expected uppercase GAME-A.GRANBLUEFANTASY.JP to be recognized as static target")
+	}
+	if !isStaticTarget("PRD-GAME-A-GRANBLUEFANTASY.AKAMAIZED.NET", "/assets/js/app.js") {
+		t.Fatal("expected uppercase Akamai host to be recognized as static target")
+	}
+	if isStaticTarget("GAME-A.GRANBLUEFANTASY.JP", "/rest/multiraid/start.json") {
+		t.Fatal("expected dynamic /rest/ path on uppercase host to remain non-static")
+	}
+
+	tempDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = 8124
+	})
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		t.Fatalf("failed to create cert manager: %v", err)
+	}
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+	defer stats.Close()
+
+	srv := NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	defer srv.Stop()
+
+	runPlainHTTP := func(reqStr string) *http.Response {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+
+		req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(reqStr)))
+		if err != nil {
+			t.Fatalf("ReadRequest failed: %v", err)
+		}
+		go func() {
+			defer c2.Close()
+			srv.handlePlainHTTP(c2, req)
+		}()
+		resp, err := http.ReadResponse(bufio.NewReader(c1), req)
+		if err != nil {
+			t.Fatalf("ReadResponse failed: %v", err)
+		}
+		return resp
+	}
+
+	// 2. LOCALHOST:8124/ca.crt -> 200 OK certificate download
+	respCA := runPlainHTTP("GET /ca.crt HTTP/1.1\r\nHost: LOCALHOST:8124\r\nConnection: close\r\n\r\n")
+	defer respCA.Body.Close()
+	if respCA.StatusCode != http.StatusOK || respCA.Header.Get("Content-Type") != "application/x-x509-ca-cert" {
+		t.Fatalf("expected 200 x509 cert for LOCALHOST:8124/ca.crt, got status=%d ct=%q", respCA.StatusCode, respCA.Header.Get("Content-Type"))
+	}
+
+	// 3. LOCALHOST:8124/proxy.pac -> 200 OK PAC referencing 127.0.0.1:8124
+	respPAC := runPlainHTTP("GET /proxy.pac HTTP/1.1\r\nHost: LOCALHOST:8124\r\nConnection: close\r\n\r\n")
+	defer respPAC.Body.Close()
+	pacBody, _ := io.ReadAll(respPAC.Body)
+	if respPAC.StatusCode != http.StatusOK || !bytes.Contains(pacBody, []byte("PROXY 127.0.0.1:8124")) {
+		t.Fatalf("expected PAC for LOCALHOST:8124 to use 127.0.0.1:8124, got status=%d body=%s", respPAC.StatusCode, string(pacBody))
+	}
+
+	// 4. LOCALHOST:8124/ -> 200 OK landing guide
+	respGuide := runPlainHTTP("GET / HTTP/1.1\r\nHost: LOCALHOST:8124\r\nConnection: close\r\n\r\n")
+	defer respGuide.Body.Close()
+	if respGuide.StatusCode != http.StatusOK || !strings.Contains(respGuide.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("expected 200 HTML landing page for LOCALHOST:8124/, got status=%d ct=%q", respGuide.StatusCode, respGuide.Header.Get("Content-Type"))
+	}
+
+	// 5. LOCALHOST:8124/unknown-self-loop -> 404 Not Found via self-loop prevention
+	respLoop := runPlainHTTP("GET http://LOCALHOST:8124/unknown-self-loop HTTP/1.1\r\nHost: LOCALHOST:8124\r\nConnection: close\r\n\r\n")
+	defer respLoop.Body.Close()
+	if respLoop.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for self-loop request to LOCALHOST:8124, got %d", respLoop.StatusCode)
+	}
+
+	// 6. Plain HTTP static asset with uppercase CDN Host routes to handleStaticAsset and hits cache
+	const assetPath = "/assets/js/upper_host_test.js"
+	const assetBody = "console.log('upper_host_cached');"
+	cacheMgr.SaveRAMValidatedWithNamespace("gbf", assetPath, map[string]string{
+		"content-type": "application/javascript",
+		"etag":         `"upper-etag"`,
+	}, []byte(assetBody))
+
+	respAsset := runPlainHTTP("GET http://PRD-GAME-A-GRANBLUEFANTASY.AKAMAIZED.NET" + assetPath + " HTTP/1.1\r\nHost: PRD-GAME-A-GRANBLUEFANTASY.AKAMAIZED.NET\r\nConnection: close\r\n\r\n")
+	defer respAsset.Body.Close()
+	gotAsset, _ := io.ReadAll(respAsset.Body)
+	if respAsset.StatusCode != http.StatusOK || string(gotAsset) != assetBody {
+		t.Fatalf("expected 200 cached asset for uppercase CDN host, got status=%d body=%q", respAsset.StatusCode, string(gotAsset))
+	}
+}
+

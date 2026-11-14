@@ -1,0 +1,3070 @@
+package control
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"gbf-proxy/cache"
+	"gbf-proxy/cert"
+	"gbf-proxy/config"
+	"gbf-proxy/firewall"
+	"gbf-proxy/health"
+	"gbf-proxy/proxy"
+	"gbf-proxy/sysproxy"
+	"gbf-proxy/telemetry"
+)
+
+func TestAllowedOrigin(t *testing.T) {
+	allowed := []string{
+		"",
+		"http://localhost",
+		"http://localhost:8125",
+		"http://127.0.0.1",
+		"http://127.0.0.1:8125",
+		"http://[::1]:8125",
+	}
+	for _, o := range allowed {
+		if !isAllowedOrigin(o) {
+			t.Errorf("origin %q should be allowed", o)
+		}
+	}
+
+	disallowed := []string{
+		"http://evil.com",
+		"http://attacker.org:8125",
+		"http://localhost.evil.com",
+		"http://127.0.0.1.attacker.com",
+		"://invalid-url",
+	}
+	for _, o := range disallowed {
+		if isAllowedOrigin(o) {
+			t.Errorf("origin %q should be blocked", o)
+		}
+	}
+}
+
+func TestControlCORSProtection(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// 1. Request with evil Origin must be blocked with 403 Forbidden
+	reqEvil := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqEvil.Host = "127.0.0.1:8125"
+	reqEvil.RemoteAddr = "127.0.0.1:12345"
+	reqEvil.Header.Set("Origin", "http://evil.com")
+	wEvil := httptest.NewRecorder()
+	ctrl.handleRoute(wEvil, reqEvil)
+
+	if wEvil.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for evil origin, got %d", wEvil.Code)
+	}
+
+	// 2. Request with local Origin must be accepted with 200 OK and matching Access-Control-Allow-Origin
+	reqLocal := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqLocal.Host = "127.0.0.1:8125"
+	reqLocal.RemoteAddr = "127.0.0.1:12345"
+	reqLocal.Header.Set("Origin", "http://127.0.0.1:8125")
+	wLocal := httptest.NewRecorder()
+	ctrl.handleRoute(wLocal, reqLocal)
+
+	if wLocal.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for local origin, got %d", wLocal.Code)
+	}
+	if wLocal.Header().Get("Access-Control-Allow-Origin") != "http://127.0.0.1:8125" {
+		t.Fatalf("expected Access-Control-Allow-Origin to be reflected, got %q", wLocal.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// 3. Request without Origin (e.g. desktop CLI, curl) must succeed
+	reqDirect := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqDirect.Host = "127.0.0.1:8125"
+	reqDirect.RemoteAddr = "127.0.0.1:12345"
+	wDirect := httptest.NewRecorder()
+	ctrl.handleRoute(wDirect, reqDirect)
+
+	if wDirect.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for direct request, got %d", wDirect.Code)
+	}
+}
+
+func TestControlRemoteAddrSecurity(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	tests := []struct {
+		name         string
+		remoteAddr   string
+		host         string
+		path         string
+		expectedCode int
+	}{
+		{
+			name:         "IPv4 Loopback allowed on /api/status",
+			remoteAddr:   "127.0.0.1:54321",
+			host:         "127.0.0.1:8125",
+			path:         "/api/status",
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "IPv6 Loopback allowed on /api/status",
+			remoteAddr:   "[::1]:54321",
+			host:         "[::1]:8125",
+			path:         "/api/status",
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "IPv4 Loopback allowed on /api/health",
+			remoteAddr:   "127.0.0.1:54321",
+			host:         "127.0.0.1:8125",
+			path:         "/api/health",
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "IPv6 Loopback allowed on /api/health",
+			remoteAddr:   "[::1]:54321",
+			host:         "[::1]:8125",
+			path:         "/api/health",
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "LAN RemoteAddr blocked with 403 on status",
+			remoteAddr:   "192.168.1.100:54321",
+			host:         "192.168.1.100:8125",
+			path:         "/api/status",
+			expectedCode: http.StatusForbidden,
+		},
+		{
+			name:         "LAN RemoteAddr blocked with 403 on health",
+			remoteAddr:   "192.168.1.100:54321",
+			host:         "192.168.1.100:8125",
+			path:         "/api/health",
+			expectedCode: http.StatusForbidden,
+		},
+		{
+			name:         "Host forged as 127.0.0.1 but RemoteAddr is LAN blocked with 403",
+			remoteAddr:   "192.168.1.50:54321",
+			host:         "127.0.0.1:8125",
+			path:         "/api/status",
+			expectedCode: http.StatusForbidden,
+		},
+		{
+			name:         "Host forged as 127.0.0.1 on repair API blocked with 403",
+			remoteAddr:   "192.168.1.50:54321",
+			host:         "127.0.0.1:8125",
+			path:         "/api/health/repair",
+			expectedCode: http.StatusForbidden,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			method := http.MethodGet
+			if tc.path == "/api/health/repair" {
+				method = http.MethodPost
+			}
+			req := httptest.NewRequest(method, tc.path, nil)
+			req.Host = tc.host
+			req.RemoteAddr = tc.remoteAddr
+			w := httptest.NewRecorder()
+			ctrl.handleRoute(w, req)
+			if w.Code != tc.expectedCode {
+				t.Errorf("%s: expected HTTP %d, got %d (body: %s)", tc.name, tc.expectedCode, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestControlServerLifecycleRestart(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	// Bind to port 0 for automatic available port
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = 0
+	})
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// First lifecycle
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("first start failed: %v", err)
+	}
+	ctrl.Stop()
+
+	// Second lifecycle: must restart cleanly without panic
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("second start after stop failed: %v", err)
+	}
+	ctrl.Stop()
+}
+
+func TestControlDNSRebindingProtection(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// Blocked hosts (DNS rebinding attacks)
+	blockedHosts := []string{
+		"evil.com",
+		"attacker.org:8125",
+		"localhost.evil.com",
+		"127.0.0.1.attacker.com",
+		"example.com",
+		"example.com:8125",
+		"192.168.1.99:8125", // LAN disabled by default
+	}
+	for _, h := range blockedHosts {
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		req.Host = h
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		ctrl.handleRoute(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("host %q should be rejected with 403 Forbidden, got %d", h, w.Code)
+		}
+	}
+
+	// Allowed hosts (loopback)
+	allowedHosts := []string{
+		"127.0.0.1",
+		"127.0.0.1:8125",
+		"localhost",
+		"localhost:8125",
+		"[::1]:8125",
+	}
+	for _, h := range allowedHosts {
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		req.Host = h
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		ctrl.handleRoute(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("host %q should be allowed with 200 OK, got %d", h, w.Code)
+		}
+	}
+
+	// Test AllowLAN: 8125 Control Plane must strictly reject non-loopback Host headers
+	// (including the machine's own LAN IP) even when AllowLAN is enabled.
+	cfgMgr.Update(func(c *config.Config) {
+		c.AllowLAN = true
+	})
+	lanHosts := []string{"192.168.1.99:8125"}
+	if lanIP := config.GetLANIP(); lanIP != "" {
+		lanHosts = append(lanHosts, lanIP, lanIP+":8125")
+	}
+	for _, h := range lanHosts {
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		req.Host = h
+		req.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		ctrl.handleRoute(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("LAN Host %q on control plane must be rejected with 403 Forbidden even when AllowLAN is true, got %d", req.Host, w.Code)
+		}
+	}
+}
+
+func TestControlApplyConfigAllFields(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	patchJSON := `{
+		"control_port": 8130,
+		"api_max_connections": 20,
+		"api_max_keepalive": 8,
+		"api_keepalive_expiry": 45.0,
+		"asset_max_connections": 32,
+		"asset_max_keepalive": 16,
+		"asset_keepalive_expiry": 75.0,
+		"ram_warmup_max_items": 2000,
+		"enable_api_telemetry": false,
+		"clean_zombies": false
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(patchJSON))
+	req.Host = "127.0.0.1:8125"
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg := cfgMgr.Get()
+	if cfg.ControlPort != 8130 {
+		t.Errorf("expected ControlPort 8130, got %d", cfg.ControlPort)
+	}
+	if cfg.APIMaxConnections != 20 {
+		t.Errorf("expected APIMaxConnections 20, got %d", cfg.APIMaxConnections)
+	}
+	if cfg.APIMaxKeepalive != 8 {
+		t.Errorf("expected APIMaxKeepalive 8, got %d", cfg.APIMaxKeepalive)
+	}
+	if cfg.APIKeepaliveExpiry != 45.0 {
+		t.Errorf("expected APIKeepaliveExpiry 45.0, got %f", cfg.APIKeepaliveExpiry)
+	}
+	if cfg.AssetMaxConnections != 32 {
+		t.Errorf("expected AssetMaxConnections 32, got %d", cfg.AssetMaxConnections)
+	}
+	if cfg.AssetMaxKeepalive != 16 {
+		t.Errorf("expected AssetMaxKeepalive 16, got %d", cfg.AssetMaxKeepalive)
+	}
+	if cfg.AssetKeepaliveExpiry != 75.0 {
+		t.Errorf("expected AssetKeepaliveExpiry 75.0, got %f", cfg.AssetKeepaliveExpiry)
+	}
+	if cfg.RAMWarmupMaxItems != 2000 {
+		t.Errorf("expected RAMWarmupMaxItems 2000, got %d", cfg.RAMWarmupMaxItems)
+	}
+	if cfg.EnableAPITelemetry != false {
+		t.Errorf("expected EnableAPITelemetry false, got true")
+	}
+	if cfg.CleanZombies != false {
+		t.Errorf("expected CleanZombies false, got true")
+	}
+}
+
+func TestNewControlAPIs(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	testRoute := func(method, path string, body string) *httptest.ResponseRecorder {
+		var r *http.Request
+		if body != "" {
+			r = httptest.NewRequest(method, path, strings.NewReader(body))
+		} else {
+			r = httptest.NewRequest(method, path, nil)
+		}
+		r.Host = "127.0.0.1:8125"
+		r.RemoteAddr = "127.0.0.1:12345"
+		w := httptest.NewRecorder()
+		ctrl.handleRoute(w, r)
+		return w
+	}
+
+	// 1. /api/upstream/detect
+	wUp := testRoute(http.MethodGet, "/api/upstream/detect", "")
+	if wUp.Code != http.StatusOK {
+		t.Errorf("/api/upstream/detect expected 200, got %d", wUp.Code)
+	}
+	// 1b. /api/upstream/status
+	wUs := testRoute(http.MethodGet, "/api/upstream/status", "")
+	if wUs.Code != http.StatusOK {
+		t.Fatalf("/api/upstream/status expected 200, got %d", wUs.Code)
+	}
+	var us map[string]interface{}
+	if err := json.Unmarshal(wUs.Body.Bytes(), &us); err != nil {
+		t.Fatalf("decode upstream status: %v", err)
+	}
+	statusObj, ok := us["status"].(map[string]interface{})
+	if !ok || statusObj["active"] != "primary" {
+		t.Fatalf("expected primary status, got %v", us["status"])
+	}
+
+	// 2. /api/cache/detect-acgpower
+	wAcg := testRoute(http.MethodGet, "/api/cache/detect-acgpower", "")
+	if wAcg.Code != http.StatusOK {
+		t.Errorf("/api/cache/detect-acgpower expected 200, got %d", wAcg.Code)
+	}
+
+	// 3. /api/update/check and /api/updater/check alias
+	wUpd := testRoute(http.MethodGet, "/api/update/check", "")
+	if wUpd.Code != http.StatusOK {
+		t.Errorf("/api/update/check expected 200, got %d", wUpd.Code)
+	}
+	wUpdater := testRoute(http.MethodGet, "/api/updater/check", "")
+	if wUpdater.Code != http.StatusOK {
+		t.Errorf("/api/updater/check expected 200, got %d", wUpdater.Code)
+	}
+
+	// 4. /api/update/download-status and /api/updater/download-status alias
+	wUpdStat := testRoute(http.MethodGet, "/api/update/download-status", "")
+	if wUpdStat.Code != http.StatusOK {
+		t.Errorf("/api/update/download-status expected 200, got %d", wUpdStat.Code)
+	}
+	wUpdaterStat := testRoute(http.MethodGet, "/api/updater/download-status", "")
+	if wUpdaterStat.Code != http.StatusOK {
+		t.Errorf("/api/updater/download-status expected 200, got %d", wUpdaterStat.Code)
+	}
+
+	// 5. /api/cert/status
+	wCert := testRoute(http.MethodGet, "/api/cert/status", "")
+	if wCert.Code != http.StatusOK {
+		t.Errorf("/api/cert/status expected 200, got %d", wCert.Code)
+	}
+
+	// 6. /api/startup/status
+	wStart := testRoute(http.MethodGet, "/api/startup/status", "")
+	if wStart.Code != http.StatusOK {
+		t.Errorf("/api/startup/status expected 200, got %d", wStart.Code)
+	}
+
+	// 7. /api/cache/task-status
+	wTask := testRoute(http.MethodGet, "/api/cache/task-status", "")
+	if wTask.Code != http.StatusOK {
+		t.Errorf("/api/cache/task-status expected 200, got %d", wTask.Code)
+	}
+
+	// 8. Mutual exclusion: while auditing is active, slimming must return 409 Conflict
+	ctrl.cacheTaskMu.Lock()
+	ctrl.isAuditing = true
+	ctrl.cacheTaskMu.Unlock()
+
+	wSlimConflict := testRoute(http.MethodPost, "/api/cache/slim", "")
+	if wSlimConflict.Code != http.StatusConflict {
+		t.Errorf("expected 409 Conflict for slim while auditing, got %d", wSlimConflict.Code)
+	}
+
+	ctrl.cacheTaskMu.Lock()
+	ctrl.isAuditing = false
+	ctrl.isSlimming = true
+	ctrl.cacheTaskMu.Unlock()
+
+	wAuditConflict := testRoute(http.MethodPost, "/api/cache/audit", "")
+	if wAuditConflict.Code != http.StatusConflict {
+		t.Errorf("expected 409 Conflict for audit while slimming, got %d", wAuditConflict.Code)
+	}
+
+	ctrl.cacheTaskMu.Lock()
+	ctrl.isSlimming = false
+	ctrl.cacheTaskMu.Unlock()
+
+	// 9. Cancel task
+	wCancel := testRoute(http.MethodPost, "/api/cache/cancel-task", "")
+	if wCancel.Code != http.StatusOK {
+		t.Errorf("/api/cache/cancel-task expected 200, got %d", wCancel.Code)
+	}
+}
+
+// getTelemetrySummary must report REAL observed connection reuse, protocol mix and
+// latency percentiles, not hardcoded placeholder values.
+func TestGetTelemetrySummaryRealData(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// Seed real observations: 3 reused + 1 new conn => 75% reuse; protocol mix 3x H2, 1x H1.
+	stats.RecordConnReuse(true)
+	stats.RecordConnReuse(true)
+	stats.RecordConnReuse(true)
+	stats.RecordConnReuse(false)
+	stats.RecordProtocol("HTTP/2.0")
+	stats.RecordProtocol("HTTP/2.0")
+	stats.RecordProtocol("HTTP/2.0")
+	stats.RecordProtocol("HTTP/1.1")
+	for i := 1; i <= 10; i++ {
+		stats.RecordLatency(float64(i * 10)) // 10ms..100ms
+	}
+
+	sum := ctrl.getTelemetrySummary()
+
+	if got := sum["reused_connections"].(int64); got != 3 {
+		t.Errorf("expected 3 reused connections, got %v", got)
+	}
+	if got := sum["new_connections"].(int64); got != 1 {
+		t.Errorf("expected 1 new connection, got %v", got)
+	}
+	if got := sum["reuse_rate_percent"].(float64); got != 75.0 {
+		t.Errorf("expected reuse_rate_percent 75.0, got %v", got)
+	}
+
+	protos := sum["protocols"].(map[string]int64)
+	if protos["HTTP/2"] != 3 || protos["HTTP/1.1"] != 1 {
+		t.Errorf("expected protocols H2=3 H1=1, got %v", protos)
+	}
+
+	pct := sum["percentiles"].(map[string]interface{})
+	if pct["samples"].(int) != 10 {
+		t.Errorf("expected 10 latency samples, got %v", pct["samples"])
+	}
+	if pct["max_ms"].(float64) != 100.0 {
+		t.Errorf("expected max_ms 100.0, got %v", pct["max_ms"])
+	}
+	if pct["min_ms"].(float64) != 10.0 {
+		t.Errorf("expected min_ms 10.0, got %v", pct["min_ms"])
+	}
+}
+
+func TestControlProxyStartFailureAndSuccess(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	// Pick a free port and keep it occupied to force proxy listen failure
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	defer l.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = port
+	})
+
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+
+	// 1. Calling /api/proxy/start when port is occupied should fail with 500
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy/start", nil)
+	req.Host = "127.0.0.1:8125"
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when proxy cannot bind port, got %d", w.Code)
+	}
+
+	var failResp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &failResp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if failResp["ok"] != false {
+		t.Errorf("expected ok=false in error response, got %v", failResp["ok"])
+	}
+	if errMsg, ok := failResp["error"].(string); !ok || errMsg == "" {
+		t.Errorf("expected non-empty error message, got %v", failResp["error"])
+	}
+
+	// 2. Free the port and try again -> should succeed with 200
+	_ = l.Close()
+
+	wSuccess := httptest.NewRecorder()
+	ctrl.handleRoute(wSuccess, req)
+
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 when proxy starts successfully, got %d", wSuccess.Code)
+	}
+
+	var okResp map[string]interface{}
+	if err := json.Unmarshal(wSuccess.Body.Bytes(), &okResp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if okResp["ok"] != true {
+		t.Errorf("expected ok=true, got %v", okResp["ok"])
+	}
+}
+
+func TestControlProxyStartNilProxyServer(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// ControlServer with nil ProxyServer
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy/start", nil)
+	req.Host = "127.0.0.1:8125"
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when proxy server is nil, got %d", w.Code)
+	}
+
+	var failResp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &failResp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if failResp["ok"] != false {
+		t.Errorf("expected ok=false in error response, got %v", failResp["ok"])
+	}
+}
+
+func TestControlServer_ReloadListener_InFlightRequestCompletes(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// Pick two free ports
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to pick port 1: %v", err)
+	}
+	port1 := l1.Addr().(*net.TCPAddr).Port
+	_ = l1.Close()
+
+	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to pick port 2: %v", err)
+	}
+	port2 := l2.Addr().(*net.TCPAddr).Port
+	_ = l2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = port1
+	})
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server on port %d: %v", port1, err)
+	}
+	defer ctrl.Stop()
+
+	// Send HTTP POST to port1 requesting migration to port2
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", port1)
+	body := fmt.Sprintf(`{"control_port": %d}`, port2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("in-flight request failed during reload: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+
+	expectedURL := fmt.Sprintf("http://127.0.0.1:%d", port2)
+	if resData["control_url"] != expectedURL {
+		t.Errorf("expected control_url=%q, got %v", expectedURL, resData["control_url"])
+	}
+
+	// Verify new port2 is responsive
+	statusURL := fmt.Sprintf("http://127.0.0.1:%d/api/status", port2)
+	sResp, err := http.Get(statusURL)
+	if err != nil {
+		t.Fatalf("failed to reach new control port %d: %v", port2, err)
+	}
+	sResp.Body.Close()
+	if sResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 on new port, got %d", sResp.StatusCode)
+	}
+}
+
+func TestControlServer_ApplyConfig_ProxySuccess_ControlFail_Rollback(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgFile := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgFile)
+
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// Pick 4 ports:
+	// proxyPort1: initial proxy port
+	// proxyPort2: target proxy port
+	// ctrlPort1: initial control port
+	// ctrlPort2: target control port (occupied by dummy listener to force Control reload failure)
+	lP1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to pick proxyPort1: %v", err)
+	}
+	proxyPort1 := lP1.Addr().(*net.TCPAddr).Port
+	_ = lP1.Close()
+
+	lP2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to pick proxyPort2: %v", err)
+	}
+	proxyPort2 := lP2.Addr().(*net.TCPAddr).Port
+	_ = lP2.Close()
+
+	lC1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to pick ctrlPort1: %v", err)
+	}
+	ctrlPort1 := lC1.Addr().(*net.TCPAddr).Port
+	_ = lC1.Close()
+
+	// Keep lC2 open so ctrlPort2 is OCCUPIED
+	lC2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind dummy listener on ctrlPort2: %v", err)
+	}
+	defer lC2.Close()
+	ctrlPort2 := lC2.Addr().(*net.TCPAddr).Port
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = proxyPort1
+		c.ControlPort = ctrlPort1
+	})
+
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Verify initial proxy connectivity on proxyPort1
+	pConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to connect to initial proxy port %d: %v", proxyPort1, err)
+	}
+	_ = pConn.Close()
+
+	// Send POST /api/config/apply requesting proxyPort2 (succeeds) and ctrlPort2 (fails)
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort1)
+	body := fmt.Sprintf(`{"listen_port": %d, "control_port": %d}`, proxyPort2, ctrlPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request to apply config failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Expect HTTP 500 Internal Server Error due to control rebind failure
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500, got %d", resp.StatusCode)
+	}
+
+	var resData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if errMsg, _ := resData["error"].(string); !strings.Contains(errMsg, "控制端口重载失败") {
+		t.Errorf("expected error message to contain '控制端口重载失败', got %q", errMsg)
+	}
+
+	// Verify proxy rolled back to proxyPort1
+	pConnRollback, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 500*time.Millisecond)
+	if err != nil {
+		t.Errorf("proxy failed to rollback to original port %d: %v", proxyPort1, err)
+	} else {
+		_ = pConnRollback.Close()
+	}
+
+	// Verify proxy is NOT listening on proxyPort2
+	pConnP2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 100*time.Millisecond)
+	if err == nil {
+		_ = pConnP2.Close()
+		t.Errorf("proxy is unexpectedly still listening on port %d after rollback", proxyPort2)
+	}
+
+	// Verify control server is still running on ctrlPort1
+	statusURL := fmt.Sprintf("http://127.0.0.1:%d/api/status", ctrlPort1)
+	sResp, err := http.Get(statusURL)
+	if err != nil {
+		t.Fatalf("control server on original port %d unreachable after rollback: %v", ctrlPort1, err)
+	}
+	sResp.Body.Close()
+	if sResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 on original control port, got %d", sResp.StatusCode)
+	}
+
+	// Verify configuration was NOT committed
+	currentCfg := cfgMgr.Get()
+	if currentCfg.ListenPort != proxyPort1 {
+		t.Errorf("expected ListenPort to remain %d, got %d", proxyPort1, currentCfg.ListenPort)
+	}
+	if currentCfg.ControlPort != ctrlPort1 {
+		t.Errorf("expected ControlPort to remain %d, got %d", ctrlPort1, currentCfg.ControlPort)
+	}
+}
+
+func TestControlServer_ApplyConfig_SaveFail_RollbackBoth(t *testing.T) {
+	tempDir := t.TempDir()
+	subDir := filepath.Join(tempDir, "config_sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create config subdir: %v", err)
+	}
+	cfgFile := filepath.Join(subDir, "config.json")
+	cfgMgr := config.NewManager(cfgFile)
+
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// Pick 4 free ports
+	lP1, _ := net.Listen("tcp", "127.0.0.1:0")
+	proxyPort1 := lP1.Addr().(*net.TCPAddr).Port
+	_ = lP1.Close()
+
+	lP2, _ := net.Listen("tcp", "127.0.0.1:0")
+	proxyPort2 := lP2.Addr().(*net.TCPAddr).Port
+	_ = lP2.Close()
+
+	lC1, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctrlPort1 := lC1.Addr().(*net.TCPAddr).Port
+	_ = lC1.Close()
+
+	lC2, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctrlPort2 := lC2.Addr().(*net.TCPAddr).Port
+	_ = lC2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = proxyPort1
+		c.ControlPort = ctrlPort1
+	})
+
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Make Save() fail by replacing subDir directory with a plain regular file
+	if err := os.RemoveAll(subDir); err != nil {
+		t.Fatalf("failed to remove config subdir: %v", err)
+	}
+	if err := os.WriteFile(subDir, []byte("blocker_file"), 0644); err != nil {
+		t.Fatalf("failed to write blocker file: %v", err)
+	}
+
+	// Send POST /api/config/apply requesting both ports to change
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort1)
+	body := fmt.Sprintf(`{"listen_port": %d, "control_port": %d}`, proxyPort2, ctrlPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request to apply config failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 due to save failure, got %d", resp.StatusCode)
+	}
+
+	var resData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if errMsg, _ := resData["error"].(string); !strings.Contains(errMsg, "配置持久化失败") {
+		t.Errorf("expected error message to contain '配置持久化失败', got %q", errMsg)
+	}
+
+	// Verify proxy rolled back to proxyPort1
+	pConn1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 500*time.Millisecond)
+	if err != nil {
+		t.Errorf("proxy failed to rollback to proxyPort1 %d: %v", proxyPort1, err)
+	} else {
+		_ = pConn1.Close()
+	}
+
+	// Verify proxy is NOT listening on proxyPort2
+	pConn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 100*time.Millisecond)
+	if err == nil {
+		_ = pConn2.Close()
+		t.Errorf("proxy should NOT be listening on proxyPort2 after rollback")
+	}
+
+	// Verify control rolled back to ctrlPort1
+	statusURL := fmt.Sprintf("http://127.0.0.1:%d/api/status", ctrlPort1)
+	sResp, err := http.Get(statusURL)
+	if err != nil {
+		t.Fatalf("control server unreachable on rolled-back port %d: %v", ctrlPort1, err)
+	}
+	sResp.Body.Close()
+	if sResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 on rolled-back control port, got %d", sResp.StatusCode)
+	}
+
+	// Verify ctrlPort2 is NOT listening
+	cConn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", ctrlPort2), 100*time.Millisecond)
+	if err == nil {
+		_ = cConn2.Close()
+		t.Errorf("control should NOT be listening on ctrlPort2 after rollback")
+	}
+
+	// Verify memory config rolled back to old values
+	currentCfg := cfgMgr.Get()
+	if currentCfg.ListenPort != proxyPort1 {
+		t.Errorf("expected ListenPort %d, got %d", proxyPort1, currentCfg.ListenPort)
+	}
+	if currentCfg.ControlPort != ctrlPort1 {
+		t.Errorf("expected ControlPort %d, got %d", ctrlPort1, currentCfg.ControlPort)
+	}
+}
+
+func TestControlServer_AppQuit(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgFile := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgFile)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+	quitCalled := make(chan struct{})
+	ctrl.SetQuitFunc(func() {
+		close(quitCalled)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/app/quit", nil)
+	req.Host = "127.0.0.1:8125"
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if resp["ok"] != true {
+		t.Errorf("expected ok=true, got %v", resp["ok"])
+	}
+
+	select {
+	case <-quitCalled:
+		// Succeeded
+	case <-time.After(1 * time.Second):
+		t.Fatal("quitFunc was not called within timeout")
+	}
+}
+
+func TestControlServer_LANIsolation(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// Allocate 2 distinct free ports
+	lP, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate proxy port: %v", err)
+	}
+	proxyPort := lP.Addr().(*net.TCPAddr).Port
+	_ = lP.Close()
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	// Configure with AllowLAN = true
+	cfgMgr.Update(func(c *config.Config) {
+		c.AllowLAN = true
+		c.ListenPort = proxyPort
+		c.ControlPort = ctrlPort
+		c.DirectMode = true
+		c.CacheDir = tempDir
+	})
+
+	certMgr, err := cert.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to create cert manager: %v", err)
+	}
+
+	proxySrv := proxy.NewProxyServer(cfgMgr, certMgr, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, certMgr, cacheMgr, proxySrv, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// 1. Verify control server strictly binds to 127.0.0.1, even when AllowLAN = true
+	ctrlAddr := ctrl.listener.Addr().String()
+	expectedCtrlAddr := fmt.Sprintf("127.0.0.1:%d", ctrlPort)
+	if ctrlAddr != expectedCtrlAddr {
+		t.Fatalf("control server must bind strictly to %s, got %s", expectedCtrlAddr, ctrlAddr)
+	}
+
+	// 2. 127.0.0.1:8125 -> Connection SUCCEEDS (HTTP 200)
+	statusURL := fmt.Sprintf("http://127.0.0.1:%d/api/status", ctrlPort)
+	resp, err := http.Get(statusURL)
+	if err != nil {
+		t.Fatalf("failed to connect to control server on 127.0.0.1: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK from 127.0.0.1:%d, got %d", ctrlPort, resp.StatusCode)
+	}
+
+	// 3. 127.0.0.1:8124 -> Connection SUCCEEDS
+	proxyConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to proxy on 127.0.0.1: %v", err)
+	}
+	proxyConn.Close()
+
+	// 4. Physical / Virtual LAN Interface test
+	lanIP := config.GetLANIP()
+	if lanIP == "" || lanIP == "127.0.0.1" {
+		t.Log("no non-loopback LAN IP detected on this host, skipping interface-level socket dial")
+		return
+	}
+
+	lanCtrlAddr := net.JoinHostPort(lanIP, fmt.Sprintf("%d", ctrlPort))
+	lanProxyAddr := net.JoinHostPort(lanIP, fmt.Sprintf("%d", proxyPort))
+
+	// LAN-IP:8125 -> Connection MUST FAIL (connection refused or timeout)
+	ctrlConn, err := net.DialTimeout("tcp", lanCtrlAddr, 300*time.Millisecond)
+	if err == nil {
+		ctrlConn.Close()
+		t.Fatalf("CRITICAL SECURITY VIOLATION: control server (port %d) is reachable via LAN IP %s when AllowLAN=true!", ctrlPort, lanIP)
+	}
+
+	// LAN-IP:8124 -> Connection SUCCEEDS (proxy is 0.0.0.0)
+	pLANConn, err := net.DialTimeout("tcp", lanProxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("proxy on LAN IP %s:%d should be accessible when AllowLAN=true, got err: %v", lanIP, proxyPort, err)
+	}
+	defer pLANConn.Close()
+
+	// Verify proxy actually serves HTTP on LAN-IP:8124
+	req := fmt.Sprintf("GET /ca.crt HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", lanIP)
+	if _, err := pLANConn.Write([]byte(req)); err != nil {
+		t.Fatalf("failed to write to proxy via LAN socket: %v", err)
+	}
+	br := bufio.NewReader(pLANConn)
+	pResp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("failed to read response from proxy via LAN socket: %v", err)
+	}
+	pResp.Body.Close()
+	if pResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK from proxy over LAN socket, got %d", pResp.StatusCode)
+	}
+
+	// 5. Penetration test: Attempt to reach control server via CONNECT through LAN proxy socket
+	// Target 127.0.0.1.nip.io:<ctrlPort> MUST be blocked with 403 Forbidden
+	pTunnelConn, err := net.DialTimeout("tcp", lanProxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to proxy via LAN socket for CONNECT test: %v", err)
+	}
+	defer pTunnelConn.Close()
+
+	connectReq := fmt.Sprintf("CONNECT 127.0.0.1.nip.io:%d HTTP/1.1\r\nHost: 127.0.0.1.nip.io:%d\r\n\r\n", ctrlPort, ctrlPort)
+	if _, err := pTunnelConn.Write([]byte(connectReq)); err != nil {
+		t.Fatalf("failed to write CONNECT request to proxy via LAN socket: %v", err)
+	}
+	tBr := bufio.NewReader(pTunnelConn)
+	tResp, err := http.ReadResponse(tBr, nil)
+	if err != nil {
+		t.Fatalf("failed to read response for CONNECT from LAN socket: %v", err)
+	}
+	tResp.Body.Close()
+	if tResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: LAN client bypassed control plane loopback isolation via CONNECT 127.0.0.1.nip.io:%d (status=%d)", ctrlPort, tResp.StatusCode)
+	}
+}
+
+func TestControlServer_ApplyConfig_SaveFail_NoRuntimeSideEffects(t *testing.T) {
+	tempDir := t.TempDir()
+	subDir := filepath.Join(tempDir, "config_sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("failed to create config subdir: %v", err)
+	}
+	cfgFile := filepath.Join(subDir, "config.json")
+	cfgMgr := config.NewManager(cfgFile)
+
+	initialCacheDir := filepath.Join(tempDir, "initial_cache")
+	if err := os.MkdirAll(initialCacheDir, 0755); err != nil {
+		t.Fatalf("failed to create initial cache dir: %v", err)
+	}
+	unwantedCacheDir := filepath.Join(tempDir, "unwanted_cache")
+
+	cacheMgr := cache.NewManager(initialCacheDir, 32)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// Pick 2 free ports
+	lP, _ := net.Listen("tcp", "127.0.0.1:0")
+	proxyPort := lP.Addr().(*net.TCPAddr).Port
+	_ = lP.Close()
+
+	lC, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = proxyPort
+		c.ControlPort = ctrlPort
+		c.AutoSystemProxy = false
+		c.AutoStart = false
+		c.CacheDir = initialCacheDir
+		c.RAMCacheMaxMB = 32
+	})
+
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+
+	var sysproxyCalled atomic.Bool
+	var startupCalled atomic.Bool
+
+	ctrl.enablePACProxyFn = func(url string) error {
+		sysproxyCalled.Store(true)
+		return nil
+	}
+	ctrl.disablePACProxyFn = func(force bool) error {
+		sysproxyCalled.Store(true)
+		return nil
+	}
+	ctrl.setStartupEnabledFn = func(enabled bool) error {
+		startupCalled.Store(true)
+		return nil
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Make Save() fail by replacing subDir directory with a plain regular file
+	if err := os.RemoveAll(subDir); err != nil {
+		t.Fatalf("failed to remove config subdir: %v", err)
+	}
+	if err := os.WriteFile(subDir, []byte("blocker_file"), 0644); err != nil {
+		t.Fatalf("failed to write blocker file: %v", err)
+	}
+
+	// Send POST /api/config/apply requesting side-effecting changes
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	patchBody := map[string]interface{}{
+		"auto_system_proxy": true,
+		"auto_start":        true,
+		"cache_dir":         unwantedCacheDir,
+		"ram_cache_max_mb":  256,
+	}
+	jsonBytes, _ := json.Marshal(patchBody)
+
+	req, err := http.NewRequest(http.MethodPost, applyURL, bytes.NewReader(jsonBytes))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request to apply config failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 due to save failure, got %d", resp.StatusCode)
+	}
+
+	var resData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if errMsg, _ := resData["error"].(string); !strings.Contains(errMsg, "配置持久化失败") {
+		t.Errorf("expected error message to contain '配置持久化失败', got %q", errMsg)
+	}
+
+	// 1. Verify sysproxy was NOT called
+	if sysproxyCalled.Load() {
+		t.Errorf("VIOLATION: sysproxy was executed despite Save() failure")
+	}
+
+	// 2. Verify startup was NOT called
+	if startupCalled.Load() {
+		t.Errorf("VIOLATION: startup was executed despite Save() failure")
+	}
+
+	// 3. Verify cache runtime did NOT switch
+	if currentBase := cacheMgr.GetCacheBase(); currentBase != initialCacheDir {
+		t.Errorf("VIOLATION: cache base switched to %s, expected to remain %s", currentBase, initialCacheDir)
+	}
+
+	// 4. Verify in-memory config was rolled back to initial state
+	activeCfg := cfgMgr.Get()
+	if activeCfg.AutoSystemProxy != false {
+		t.Errorf("expected AutoSystemProxy to remain false, got true")
+	}
+	if activeCfg.AutoStart != false {
+		t.Errorf("expected AutoStart to remain false, got true")
+	}
+	if activeCfg.CacheDir != initialCacheDir {
+		t.Errorf("expected CacheDir to remain %s, got %s", initialCacheDir, activeCfg.CacheDir)
+	}
+	if activeCfg.RAMCacheMaxMB != 32 {
+		t.Errorf("expected RAMCacheMaxMB to remain 32, got %d", activeCfg.RAMCacheMaxMB)
+	}
+}
+
+func TestControlServer_PortChangeWithoutAutoSystemProxy_DoesNotDisablePAC(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	lC, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	lC.Close()
+
+	lData, _ := net.Listen("tcp", "127.0.0.1:0")
+	dataPort := lData.Addr().(*net.TCPAddr).Port
+	lData.Close()
+
+	lNew, _ := net.Listen("tcp", "127.0.0.1:0")
+	newDataPort := lNew.Addr().(*net.TCPAddr).Port
+	lNew.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ListenPort = dataPort
+		c.ControlPort = ctrlPort
+		c.AutoSystemProxy = false
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(filepath.Join(tempDir, "cache"), 32)
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+
+	var disableCalled atomic.Bool
+	var enableCalled atomic.Bool
+	ctrl.enablePACProxyFn = func(url string) error {
+		enableCalled.Store(true)
+		return nil
+	}
+	ctrl.disablePACProxyFn = func(force bool) error {
+		disableCalled.Store(true)
+		return nil
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start ctrl: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Apply port change with AutoSystemProxy = false
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	patchBody := map[string]interface{}{
+		"listen_port": newDataPort,
+	}
+	jsonBytes, _ := json.Marshal(patchBody)
+
+	req, _ := http.NewRequest(http.MethodPost, applyURL, bytes.NewReader(jsonBytes))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	if disableCalled.Load() {
+		t.Fatalf("VIOLATION (H1): disablePACProxyFn was called when AutoSystemProxy was never enabled!")
+	}
+	if enableCalled.Load() {
+		t.Fatalf("VIOLATION: enablePACProxyFn was called when AutoSystemProxy is false")
+	}
+}
+
+func TestControlServer_ReloadListener_SamePortNoOp(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	lC, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+	})
+
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	ctrl.mu.RLock()
+	origLn := ctrl.listener
+	origGen := ctrl.listenerGen
+	ctrl.mu.RUnlock()
+
+	// Calling ReloadListener with same port
+	err := ctrl.ReloadListener(ctrlPort)
+	if err != nil {
+		t.Fatalf("expected ReloadListener with same port to succeed, got %v", err)
+	}
+
+	ctrl.mu.RLock()
+	currentLn := ctrl.listener
+	currentGen := ctrl.listenerGen
+	ctrl.mu.RUnlock()
+
+	if currentLn != origLn {
+		t.Errorf("expected control listener pointer to remain unchanged, orig=%p, current=%p", origLn, currentLn)
+	}
+	if currentGen != origGen {
+		t.Errorf("expected control generation to remain %d, got %d", origGen, currentGen)
+	}
+
+	// Verify server is still responding
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", ctrlPort))
+	if err != nil {
+		t.Fatalf("failed to request status after no-op reload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleLatencyTestWithMockServer(t *testing.T) {
+	mockTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("mock-target-response"))
+	}))
+	defer mockTarget.Close()
+
+	cfgMgr := config.NewManager("")
+	// Keep this unit test hermetic: CI runners may expose unrelated local proxies.
+	// The first probe must exercise the mock server directly.
+	cfgMgr.Update(func(cfg *config.Config) {
+		cfg.DirectMode = true
+		cfg.UpstreamProxy = ""
+	})
+
+	ctrl := &ControlServer{
+		cfgMgr: cfgMgr,
+	}
+
+	// Test 1: Direct mode with custom target and fast=1
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/latency-test?target=%s&fast=1", url.QueryEscape(mockTarget.URL)), nil)
+	w := httptest.NewRecorder()
+	ctrl.handleLatencyTest(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if ok, _ := res["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true, got response: %v", res)
+	}
+	if coldMs, ok := res["cold_ms"].(float64); !ok || coldMs < 0 {
+		t.Errorf("expected valid cold_ms, got: %v", res["cold_ms"])
+	}
+
+	// Test 2: Custom proxy pointing to an unreachable port with fast=1 should return ok=false quickly
+	unreachableReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/latency-test?target=%s&proxy=http://127.0.0.1:59999&fast=1", url.QueryEscape(mockTarget.URL)), nil)
+	wUnreach := httptest.NewRecorder()
+	ctrl.handleLatencyTest(wUnreach, unreachableReq)
+
+	if wUnreach.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for error report, got %d", wUnreach.Code)
+	}
+	var unreachRes map[string]interface{}
+	_ = json.Unmarshal(wUnreach.Body.Bytes(), &unreachRes)
+	if ok, _ := unreachRes["ok"].(bool); ok {
+		t.Errorf("expected ok=false for unreachable proxy, got %v", unreachRes)
+	}
+
+	// Test 3: socks5h (and case-insensitive SOCKS5H) custom proxy whitelist acceptance
+	for _, scheme := range []string{"socks5h", "SOCKS5H"} {
+		socks5hReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/latency-test?target=%s&proxy=%s://127.0.0.1:59998&fast=1", url.QueryEscape(mockTarget.URL), scheme), nil)
+		wSocks := httptest.NewRecorder()
+		ctrl.handleLatencyTest(wSocks, socks5hReq)
+
+		if wSocks.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for socks5h proxy test, got %d", wSocks.Code)
+		}
+		var socksRes map[string]interface{}
+		_ = json.Unmarshal(wSocks.Body.Bytes(), &socksRes)
+		routeDesc, _ := socksRes["route_desc"].(string)
+		if !strings.Contains(routeDesc, "127.0.0.1:59998") {
+			t.Errorf("expected route_desc to reflect accepted %s proxy, got: %s", scheme, routeDesc)
+		}
+		errMsg, _ := socksRes["error"].(string)
+		if strings.Contains(errMsg, "unsupported proxy scheme") {
+			t.Errorf("socks5h proxy scheme was rejected by transport: %s", errMsg)
+		}
+	}
+
+	// Test 4: Unsupported scheme (ftp) or missing host (socks5h://) must be ignored and fall back to direct mode
+	for _, invalidProxy := range []string{
+		"ftp://127.0.0.1:21",
+		"socks5h://",
+		"://bad-url",
+	} {
+		unsuppReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/latency-test?target=%s&proxy=%s&fast=1", url.QueryEscape(mockTarget.URL), url.QueryEscape(invalidProxy)), nil)
+		wUnsupp := httptest.NewRecorder()
+		ctrl.handleLatencyTest(wUnsupp, unsuppReq)
+		var unsuppRes map[string]interface{}
+		_ = json.Unmarshal(wUnsupp.Body.Bytes(), &unsuppRes)
+		routeDesc, _ := unsuppRes["route_desc"].(string)
+		if !strings.Contains(routeDesc, "直连模式") {
+			t.Errorf("expected invalid proxy %q to fall back to direct mode, got: %s", invalidProxy, routeDesc)
+		}
+	}
+}
+
+func TestControlRejectsInvalidBackupUpstream(t *testing.T) {
+	d := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(d, "config.json"))
+	cacheMgr := cache.NewManager(d, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(`{"backup_upstream_proxy":"ftp://127.0.0.1:21"}`))
+	req.Host = "127.0.0.1:8125"
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if cfgMgr.Get().BackupUpstreamProxy != "" {
+		t.Fatalf("invalid proxy committed: %q", cfgMgr.Get().BackupUpstreamProxy)
+	}
+}
+
+func TestCertStatusDiagnostics(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	certMgr, err := cert.NewManager(filepath.Join(tempDir, "certs"))
+	if err != nil {
+		t.Fatalf("cert.NewManager failed: %v", err)
+	}
+
+	ctrl := NewControlServer(cfgMgr, certMgr, cacheMgr, nil, stats)
+
+	r := httptest.NewRequest(http.MethodGet, "/api/cert/status", nil)
+	r.Host = "127.0.0.1:8125"
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("/api/cert/status expected 200, got %d", w.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode cert status: %v", err)
+	}
+
+	sha1, ok := body["sha1"].(string)
+	if !ok || len(sha1) != 40 {
+		t.Errorf("expected 40-char sha1 thumbprint, got %v", body["sha1"])
+	}
+	sha256, ok := body["sha256"].(string)
+	if !ok || len(strings.Split(sha256, ":")) != 32 {
+		t.Errorf("expected colon-separated sha256 fingerprint, got %v", body["sha256"])
+	}
+	if _, ok := body["installed"].(bool); !ok {
+		t.Errorf("expected boolean installed field, got %v", body["installed"])
+	}
+	store, ok := body["store"].(string)
+	if !ok {
+		t.Fatalf("expected string store field, got %v", body["store"])
+	}
+	// Windows/macOS can verify actual trust state. Linux keeps the existing
+	// platform-neutral no-op semantics for CA installation, so only store
+	// diagnostics are asserted there.
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		if store != "" {
+			t.Errorf("expected empty store for non-installed CA, got %q", store)
+		}
+		if installed, _ := body["installed"].(bool); installed {
+			t.Errorf("expected installed=false for freshly generated CA")
+		}
+	}
+	if want := certMgr.GetFingerprintSHA1(); sha1 != want {
+		t.Errorf("sha1 mismatch: got %q, want %q", sha1, want)
+	}
+	if want := certMgr.GetFingerprintSHA256(); sha256 != want {
+		t.Errorf("sha256 mismatch: got %q, want %q", sha256, want)
+	}
+}
+
+func TestCertInstallErrorExposure(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	// nil certMgr forces the install failure path.
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/cert/install", nil)
+	r.Host = "127.0.0.1:8125"
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode install response: %v", err)
+	}
+	if ok, _ := body["ok"].(bool); ok {
+		t.Errorf("expected ok=false on install failure, got %v", body["ok"])
+	}
+	errStr, ok := body["error"].(string)
+	if !ok || errStr == "" {
+		t.Fatalf("expected non-empty specific error in JSON, got %v", body["error"])
+	}
+	if !strings.Contains(errStr, "certificate manager uninitialized") {
+		t.Errorf("expected specific error detail preserved, got %q", errStr)
+	}
+}
+
+func TestControlCacheBoostAndDisable(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+
+	// Seed sample cache file
+	p := filepath.Join(tempDir, "assets", "item.png")
+	_ = os.MkdirAll(filepath.Dir(p), 0755)
+	_ = os.WriteFile(p, []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRsample"), 0644)
+	_ = os.WriteFile(p+".ext", []byte(`{"ContentType":"image/png","v":1}`), 0644)
+
+	stats := telemetry.NewStats()
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// 1. Check initial stats
+	rStats := httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	rStats.Host = "127.0.0.1:8125"
+	rStats.RemoteAddr = "127.0.0.1:12345"
+	wStats := httptest.NewRecorder()
+	ctrl.handleRoute(wStats, rStats)
+	if wStats.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/stats, got %d", wStats.Code)
+	}
+	var statsBody map[string]interface{}
+	_ = json.Unmarshal(wStats.Body.Bytes(), &statsBody)
+	if statsBody["boost_state"] != "disabled" {
+		t.Fatalf("expected initial boost_state to be disabled, got %v", statsBody["boost_state"])
+	}
+
+	// 2. Trigger Boost
+	rBoost := httptest.NewRequest(http.MethodPost, "/api/cache/boost", nil)
+	rBoost.Host = "127.0.0.1:8125"
+	rBoost.RemoteAddr = "127.0.0.1:12345"
+	wBoost := httptest.NewRecorder()
+	ctrl.handleRoute(wBoost, rBoost)
+	if wBoost.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/boost, got %d", wBoost.Code)
+	}
+
+	// Wait briefly for prewarm to finish in background
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Query task status
+	rTask := httptest.NewRequest(http.MethodGet, "/api/cache/task-status", nil)
+	rTask.Host = "127.0.0.1:8125"
+	rTask.RemoteAddr = "127.0.0.1:12345"
+	wTask := httptest.NewRecorder()
+	ctrl.handleRoute(wTask, rTask)
+	var taskBody map[string]interface{}
+	_ = json.Unmarshal(wTask.Body.Bytes(), &taskBody)
+	if taskBody["boost_progress"] == nil {
+		t.Fatalf("expected boost_progress in task-status, got nil")
+	}
+
+	// 4. Disable Boost
+	rDisable := httptest.NewRequest(http.MethodPost, "/api/cache/boost/disable", nil)
+	rDisable.Host = "127.0.0.1:8125"
+	rDisable.RemoteAddr = "127.0.0.1:12345"
+	wDisable := httptest.NewRecorder()
+	ctrl.handleRoute(wDisable, rDisable)
+	if wDisable.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/boost/disable, got %d", wDisable.Code)
+	}
+	var disableBody map[string]interface{}
+	_ = json.Unmarshal(wDisable.Body.Bytes(), &disableBody)
+	if disableBody["state"] != "disabled" {
+		t.Fatalf("expected state disabled in disable response, got %v", disableBody["state"])
+	}
+}
+
+func TestControl_StatusIncludesIsBoostingCache(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, telemetry.NewStats())
+
+	r := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	r.Host = "127.0.0.1:8125"
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/status, got %d", w.Code)
+	}
+
+	var body map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, exists := body["is_boosting_cache"]; !exists {
+		t.Fatalf("expected is_boosting_cache in /api/status response, but field was missing")
+	}
+}
+
+func TestControl_StatusSystemProxyConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, telemetry.NewStats())
+
+	// 1. When AutoSystemProxy is false, system_proxy_conflict MUST be empty string
+	r1 := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	r1.Host = "127.0.0.1:8125"
+	r1.RemoteAddr = "127.0.0.1:12345"
+	w1 := httptest.NewRecorder()
+	ctrl.handleRoute(w1, r1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/status, got %d", w1.Code)
+	}
+	var body1 map[string]interface{}
+	_ = json.Unmarshal(w1.Body.Bytes(), &body1)
+	conflict1, _ := body1["system_proxy_conflict"].(string)
+	if conflict1 != "" {
+		t.Fatalf("expected empty system_proxy_conflict when AutoSystemProxy=false, got %q", conflict1)
+	}
+
+	// 2. When AutoSystemProxy is true, system_proxy_conflict must match sysproxy.CheckProxyConflict
+	candidate := cfgMgr.Get()
+	candidate.AutoSystemProxy = true
+	if err := cfgMgr.Commit(candidate); err != nil {
+		t.Fatalf("failed to commit AutoSystemProxy=true: %v", err)
+	}
+
+	r2 := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	r2.Host = "127.0.0.1:8125"
+	r2.RemoteAddr = "127.0.0.1:12345"
+	w2 := httptest.NewRecorder()
+	ctrl.handleRoute(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/status, got %d", w2.Code)
+	}
+	var body2 map[string]interface{}
+	_ = json.Unmarshal(w2.Body.Bytes(), &body2)
+	conflict2, _ := body2["system_proxy_conflict"].(string)
+	expectedConflict := sysproxy.CheckProxyConflict(candidate.ListenPort)
+	if conflict2 != expectedConflict {
+		t.Fatalf("expected system_proxy_conflict %q, got %q", expectedConflict, conflict2)
+	}
+}
+
+func TestControl_DisableDuringActiveBoostRace(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+
+	// Seed 20 files
+	for i := 0; i < 20; i++ {
+		p := filepath.Join(tempDir, "assets", fmt.Sprintf("item_%d.png", i))
+		_ = os.MkdirAll(filepath.Dir(p), 0755)
+		_ = os.WriteFile(p, []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRsample"), 0644)
+		_ = os.WriteFile(p+".ext", []byte(`{"ContentType":"image/png","v":1}`), 0644)
+	}
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, telemetry.NewStats())
+
+	// Start Boost
+	rBoost := httptest.NewRequest(http.MethodPost, "/api/cache/boost", nil)
+	rBoost.Host = "127.0.0.1:8125"
+	rBoost.RemoteAddr = "127.0.0.1:12345"
+	wBoost := httptest.NewRecorder()
+	ctrl.handleRoute(wBoost, rBoost)
+	if wBoost.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/boost, got %d", wBoost.Code)
+	}
+
+	// Immediately Disable Boost while prewarm may still be in-flight
+	rDisable := httptest.NewRequest(http.MethodPost, "/api/cache/boost/disable", nil)
+	rDisable.Host = "127.0.0.1:8125"
+	rDisable.RemoteAddr = "127.0.0.1:12345"
+	wDisable := httptest.NewRecorder()
+	ctrl.handleRoute(wDisable, rDisable)
+	if wDisable.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/boost/disable, got %d", wDisable.Code)
+	}
+
+	// Wait for background worker to terminate
+	time.Sleep(150 * time.Millisecond)
+
+	// Check cache stats - state must be disabled, NEVER overwritten by cancelled
+	rStats := httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	rStats.Host = "127.0.0.1:8125"
+	rStats.RemoteAddr = "127.0.0.1:12345"
+	wStats := httptest.NewRecorder()
+	ctrl.handleRoute(wStats, rStats)
+	var statsBody map[string]interface{}
+	_ = json.Unmarshal(wStats.Body.Bytes(), &statsBody)
+	if statsBody["boost_state"] != "disabled" {
+		t.Fatalf("expected boost_state to remain disabled after disable, got %v", statsBody["boost_state"])
+	}
+}
+
+func TestControl_ClearAllDisablesBoost(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+
+	p := filepath.Join(tempDir, "assets", "item.png")
+	_ = os.MkdirAll(filepath.Dir(p), 0755)
+	_ = os.WriteFile(p, []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDRsample"), 0644)
+	_ = os.WriteFile(p+".ext", []byte(`{"ContentType":"image/png","v":1}`), 0644)
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, telemetry.NewStats())
+
+	// Start and wait for Boost to complete
+	rBoost := httptest.NewRequest(http.MethodPost, "/api/cache/boost", nil)
+	rBoost.Host = "127.0.0.1:8125"
+	rBoost.RemoteAddr = "127.0.0.1:12345"
+	wBoost := httptest.NewRecorder()
+	ctrl.handleRoute(wBoost, rBoost)
+	time.Sleep(100 * time.Millisecond)
+
+	// ClearAll
+	rClear := httptest.NewRequest(http.MethodPost, "/api/cache/clear", nil)
+	rClear.Host = "127.0.0.1:8125"
+	rClear.RemoteAddr = "127.0.0.1:12345"
+	wClear := httptest.NewRecorder()
+	ctrl.handleRoute(wClear, rClear)
+	if wClear.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/cache/clear, got %d", wClear.Code)
+	}
+
+	// Verify stats: boost_state must be disabled
+	rStats := httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	rStats.Host = "127.0.0.1:8125"
+	rStats.RemoteAddr = "127.0.0.1:12345"
+	wStats := httptest.NewRecorder()
+	ctrl.handleRoute(wStats, rStats)
+	var statsBody map[string]interface{}
+	_ = json.Unmarshal(wStats.Body.Bytes(), &statsBody)
+	if statsBody["boost_state"] != "disabled" {
+		t.Fatalf("expected boost_state to be disabled after ClearAll, got %v", statsBody["boost_state"])
+	}
+}
+
+func TestControlHealthEndpoint(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	r := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	r.Host = "127.0.0.1:8125"
+	r.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	ctrl.handleRoute(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/health, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal /api/health response: %v", err)
+	}
+
+	if _, ok := resp["status"]; !ok {
+		t.Errorf("missing status in /api/health response")
+	}
+	if _, ok := resp["summary"]; !ok {
+		t.Errorf("missing summary in /api/health response")
+	}
+	coreHealth, ok := resp["core_health"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("core_health is not a map")
+	}
+	expectedKeys := []string{"core", "control_plane", "data_plane", "pac", "root_ca", "cache", "config", "lan_firewall"}
+	for _, k := range expectedKeys {
+		if _, exists := coreHealth[k]; !exists {
+			t.Errorf("missing subsystem %q in core_health", k)
+		}
+	}
+
+	summary, ok := resp["summary"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("summary is not a map")
+	}
+	if total, ok := summary["total_checks"].(float64); !ok || int(total) != 8 {
+		t.Errorf("expected summary.total_checks == 8, got %v", summary["total_checks"])
+	}
+	if _, ok := resp["runtime_status"]; !ok {
+		t.Errorf("missing runtime_status in /api/health response")
+	}
+}
+
+func TestControlHealthRepairEndpoint(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	stats := telemetry.NewStats()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// 1. GET /api/health/repair should not be handled (or return non-200)
+	rGet := httptest.NewRequest(http.MethodGet, "/api/health/repair", nil)
+	rGet.Host = "127.0.0.1:8125"
+	rGet.RemoteAddr = "127.0.0.1:12345"
+	wGet := httptest.NewRecorder()
+	ctrl.handleRoute(wGet, rGet)
+	if wGet.Code == http.StatusOK {
+		t.Fatalf("expected GET /api/health/repair to not return 200, got %d", wGet.Code)
+	}
+
+	// 2. POST /api/health/repair batch repair (all healthy)
+	rPost := httptest.NewRequest(http.MethodPost, "/api/health/repair", strings.NewReader(`{}`))
+	rPost.Host = "127.0.0.1:8125"
+	rPost.RemoteAddr = "127.0.0.1:12345"
+	rPost.Header.Set("Content-Type", "application/json")
+	wPost := httptest.NewRecorder()
+	ctrl.handleRoute(wPost, rPost)
+
+	if wPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /api/health/repair, got %d (body: %s)", wPost.Code, wPost.Body.String())
+	}
+
+	var resp health.RepairResponse
+	if err := json.Unmarshal(wPost.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal /api/health/repair response: %v", err)
+	}
+	if resp.Health.Summary.TotalChecks == 0 {
+		t.Errorf("expected health response in repair output to have total_checks > 0")
+	}
+	if len(resp.Results) == 0 {
+		t.Errorf("expected batch repair to process detected issues, got 0 results")
+	}
+
+	// 3. POST /api/health/repair for unrepairable item (e.g. PORT_CONFIG_COLLISION)
+	rCollision := httptest.NewRequest(http.MethodPost, "/api/health/repair", strings.NewReader(`{"code":"PORT_CONFIG_COLLISION"}`))
+	rCollision.Host = "127.0.0.1:8125"
+	rCollision.RemoteAddr = "127.0.0.1:12345"
+	rCollision.Header.Set("Content-Type", "application/json")
+	wCollision := httptest.NewRecorder()
+	ctrl.handleRoute(wCollision, rCollision)
+
+	if wCollision.Code != http.StatusOK {
+		t.Fatalf("expected 200 from unrepairable item repair, got %d", wCollision.Code)
+	}
+	var collResp health.RepairResponse
+	if err := json.Unmarshal(wCollision.Body.Bytes(), &collResp); err != nil {
+		t.Fatalf("failed to unmarshal collision repair response: %v", err)
+	}
+	if collResp.Success {
+		t.Fatal("expected PORT_CONFIG_COLLISION repair to report success: false")
+	}
+	if len(collResp.Results) != 1 || collResp.Results[0].Success {
+		t.Fatalf("expected result step for PORT_CONFIG_COLLISION to fail, got %+v", collResp.Results)
+	}
+
+	// 4. Concurrency conflict (409)
+	checker := health.NewChecker(cfgMgr, nil, cacheMgr, nil, stats, ctrl.ListenerAddr)
+	customRepairer := health.NewRepairer(cfgMgr, nil, cacheMgr, nil, stats, checker, ctrl.ReloadListener)
+	customRepairer.SetFirewallStatusFunc(func(port int) (firewall.Status, error) {
+		return firewall.Status{Allowed: true}, nil
+	})
+	ctrl.SetRepairer(customRepairer)
+
+	startedFirst := make(chan struct{})
+	customRepairer.SetFirewallApplyFunc(func(port int) (string, error) {
+		close(startedFirst)
+		time.Sleep(150 * time.Millisecond)
+		return "", nil
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var code1, code2 int
+	go func() {
+		defer wg.Done()
+		r1 := httptest.NewRequest(http.MethodPost, "/api/health/repair", strings.NewReader(`{"code":"FIREWALL_RULE_MISSING"}`))
+		r1.Host = "127.0.0.1:8125"
+		r1.RemoteAddr = "127.0.0.1:12345"
+		w1 := httptest.NewRecorder()
+		ctrl.handleRoute(w1, r1)
+		code1 = w1.Code
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-startedFirst
+		r2 := httptest.NewRequest(http.MethodPost, "/api/health/repair", strings.NewReader(`{"code":"DATA_PLANE_STOPPED"}`))
+		r2.Host = "127.0.0.1:8125"
+		r2.RemoteAddr = "127.0.0.1:12345"
+		w2 := httptest.NewRecorder()
+		ctrl.handleRoute(w2, r2)
+		code2 = w2.Code
+	}()
+
+	wg.Wait()
+
+	if code1 != http.StatusOK {
+		t.Fatalf("expected first repair request to return 200, got %d", code1)
+	}
+	if code2 != http.StatusConflict {
+		t.Fatalf("expected second concurrent repair request to return 409 Conflict, got %d", code2)
+	}
+}
+
+func TestControlServer_UpdateDownload_RejectsCustomURLAndDest(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(filepath.Join(tempDir, "cache"), 32)
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// 1. Custom URL is rejected with 400 Bad Request
+	req1 := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"url":"http://evil.com/payload.zip"}`))
+	req1.Host = "127.0.0.1:8125"
+	req1.RemoteAddr = "127.0.0.1:12345"
+	w1 := httptest.NewRecorder()
+	ctrl.handleRoute(w1, req1)
+	if w1.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for custom url, got %d", w1.Code)
+	}
+
+	// 2. Custom dest path is rejected with 400 Bad Request
+	req2 := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"dest":"C:\\Windows\\System32\\bad.dll"}`))
+	req2.Host = "127.0.0.1:8125"
+	req2.RemoteAddr = "127.0.0.1:12345"
+	w2 := httptest.NewRecorder()
+	ctrl.handleRoute(w2, req2)
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for custom dest, got %d", w2.Code)
+	}
+}
+
+func TestControlServer_ConfigFailoverNotification(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(filepath.Join(tempDir, "cache"), 32)
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, stats)
+
+	// 1. GET /api/config: verify upstream_failover_notification is present and true by default
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	reqGet.Host = "127.0.0.1:8125"
+	reqGet.RemoteAddr = "127.0.0.1:12345"
+	wGet := httptest.NewRecorder()
+	ctrl.handleRoute(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config, got %d", wGet.Code)
+	}
+	var resGet struct {
+		OK     bool          `json:"ok"`
+		Config config.Config `json:"config"`
+	}
+	if err := json.Unmarshal(wGet.Body.Bytes(), &resGet); err != nil {
+		t.Fatalf("failed to decode /api/config: %v", err)
+	}
+	if !resGet.Config.UpstreamFailoverNotification {
+		t.Fatalf("expected default UpstreamFailoverNotification to be true, got %v", resGet.Config.UpstreamFailoverNotification)
+	}
+
+	// 2. POST /api/config/apply: set upstream_failover_notification = false
+	reqApply := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(`{"upstream_failover_notification": false}`))
+	reqApply.Host = "127.0.0.1:8125"
+	reqApply.RemoteAddr = "127.0.0.1:12345"
+	wApply := httptest.NewRecorder()
+	ctrl.handleRoute(wApply, reqApply)
+	if wApply.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config/apply, got %d: %s", wApply.Code, wApply.Body.String())
+	}
+	if cfgMgr.Get().UpstreamFailoverNotification != false {
+		t.Fatalf("expected cfgMgr config to be updated to false, got %v", cfgMgr.Get().UpstreamFailoverNotification)
+	}
+
+	// 3. POST /api/config/apply: restore upstream_failover_notification = true
+	reqApply2 := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(`{"upstream_failover_notification": true}`))
+	reqApply2.Host = "127.0.0.1:8125"
+	reqApply2.RemoteAddr = "127.0.0.1:12345"
+	wApply2 := httptest.NewRecorder()
+	ctrl.handleRoute(wApply2, reqApply2)
+	if wApply2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config/apply, got %d", wApply2.Code)
+	}
+	if cfgMgr.Get().UpstreamFailoverNotification != true {
+		t.Fatalf("expected cfgMgr config to be updated to true, got %v", cfgMgr.Get().UpstreamFailoverNotification)
+	}
+}
+
+func TestControlServer_LanguageConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+	stats := telemetry.NewStats()
+	ctrl := NewControlServer(cfgMgr, nil, nil, nil, stats)
+
+	// 1. GET /api/config: verify default language is "zh"
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	reqGet.Host = "127.0.0.1:8125"
+	reqGet.RemoteAddr = "127.0.0.1:12345"
+	wGet := httptest.NewRecorder()
+	ctrl.handleRoute(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config, got %d", wGet.Code)
+	}
+	var getResp struct {
+		OK     bool          `json:"ok"`
+		Config config.Config `json:"config"`
+	}
+	if err := json.Unmarshal(wGet.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("failed to decode /api/config: %v", err)
+	}
+	if getResp.Config.Language != "zh" {
+		t.Fatalf("expected default language 'zh', got %q", getResp.Config.Language)
+	}
+
+	// 2. POST /api/config/apply: set language = "en"
+	reqApply := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(`{"language": "en"}`))
+	reqApply.Host = "127.0.0.1:8125"
+	reqApply.RemoteAddr = "127.0.0.1:12345"
+	wApply := httptest.NewRecorder()
+	ctrl.handleRoute(wApply, reqApply)
+	if wApply.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config/apply, got %d: %s", wApply.Code, wApply.Body.String())
+	}
+	if cfgMgr.Get().Language != "en" {
+		t.Fatalf("expected cfgMgr language to be 'en', got %q", cfgMgr.Get().Language)
+	}
+
+	// 3. POST /api/config/apply: set language = "ja"
+	reqApply2 := httptest.NewRequest(http.MethodPost, "/api/config/apply", strings.NewReader(`{"language": "ja"}`))
+	reqApply2.Host = "127.0.0.1:8125"
+	reqApply2.RemoteAddr = "127.0.0.1:12345"
+	wApply2 := httptest.NewRecorder()
+	ctrl.handleRoute(wApply2, reqApply2)
+	if wApply2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/config/apply, got %d", wApply2.Code)
+	}
+	if cfgMgr.Get().Language != "ja" {
+		t.Fatalf("expected cfgMgr language to be 'ja', got %q", cfgMgr.Get().Language)
+	}
+
+	// 4. GET /api/status: verify status payload includes language = "ja"
+	reqStatus := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqStatus.Host = "127.0.0.1:8125"
+	reqStatus.RemoteAddr = "127.0.0.1:12345"
+	wStatus := httptest.NewRecorder()
+	ctrl.handleRoute(wStatus, reqStatus)
+	if wStatus.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/status, got %d", wStatus.Code)
+	}
+	var statusMap map[string]interface{}
+	if err := json.Unmarshal(wStatus.Body.Bytes(), &statusMap); err != nil {
+		t.Fatalf("failed to parse /api/status response: %v", err)
+	}
+	if gotLang, ok := statusMap["language"].(string); !ok || gotLang != "ja" {
+		t.Fatalf("expected status language to be 'ja', got %v", statusMap["language"])
+	}
+}
+
+func TestControlServer_ApplyConfig_PACFailure_DoesNotRollbackNetwork(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 1: %v", err)
+	}
+	proxyPort1 := lProxy1.Addr().(*net.TCPAddr).Port
+	_ = lProxy1.Close()
+
+	lProxy2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 2: %v", err)
+	}
+	proxyPort2 := lProxy2.Addr().(*net.TCPAddr).Port
+	_ = lProxy2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort1
+		c.AutoSystemProxy = false
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.enablePACProxyFn = func(url string) error {
+		return errors.New("simulated PAC error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Initial check: proxy listens on proxyPort1
+	conn1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("initial proxy port unreachable: %v", err)
+	}
+	_ = conn1.Close()
+
+	// Apply port change to proxyPort2 AND enable auto_system_proxy
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := fmt.Sprintf(`{"listen_port": %d, "auto_system_proxy": true}`, proxyPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Message  string        `json:"message"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if !resData.OK {
+		t.Fatalf("expected ok=true, got false")
+	}
+	if len(resData.Warnings) == 0 {
+		t.Fatalf("expected warnings in response, got none")
+	}
+	foundWarning := false
+	for _, w := range resData.Warnings {
+		if strings.Contains(w, "系统代理设置失败") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected warning to mention '系统代理设置失败', got %v", resData.Warnings)
+	}
+
+	// 1. Network listener MUST NOT have rolled back: proxy MUST listen on proxyPort2
+	conn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("network transaction was rolled back! proxy not listening on %d: %v", proxyPort2, err)
+	}
+	_ = conn2.Close()
+
+	// 2. Old port MUST be closed
+	connOld, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 200*time.Millisecond)
+	if err == nil {
+		_ = connOld.Close()
+		t.Errorf("proxy is still listening on old port %d", proxyPort1)
+	}
+
+	// 3. Backend configuration semantics: AutoSystemProxy must be reconciled to false
+	if resData.Config.AutoSystemProxy != false {
+		t.Errorf("expected response config.AutoSystemProxy to be reconciled to false, got %v", resData.Config.AutoSystemProxy)
+	}
+	if resData.Config.ListenPort != proxyPort2 {
+		t.Errorf("expected response config.ListenPort to be %d, got %d", proxyPort2, resData.Config.ListenPort)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.AutoSystemProxy != false {
+		t.Errorf("expected cfgMgr.Get().AutoSystemProxy to be false, got true")
+	} else if activeCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected cfgMgr.Get().ListenPort to be %d, got %d", proxyPort2, activeCfg.ListenPort)
+	}
+
+	// 4. Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.AutoSystemProxy != false {
+		t.Errorf("expected disk config.AutoSystemProxy to be false, got %v", diskCfg.AutoSystemProxy)
+	}
+	if diskCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected disk config.ListenPort to be %d, got %d", proxyPort2, diskCfg.ListenPort)
+	}
+}
+
+func TestControlServer_ApplyConfig_StartupFailure_DoesNotRollbackNetwork(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 1: %v", err)
+	}
+	proxyPort1 := lProxy1.Addr().(*net.TCPAddr).Port
+	_ = lProxy1.Close()
+
+	lProxy2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 2: %v", err)
+	}
+	proxyPort2 := lProxy2.Addr().(*net.TCPAddr).Port
+	_ = lProxy2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort1
+		c.AutoStart = false
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.setStartupEnabledFn = func(enabled bool) error {
+		return errors.New("simulated startup error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Apply port change to proxyPort2 AND enable auto_start
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := fmt.Sprintf(`{"listen_port": %d, "auto_start": true}`, proxyPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Message  string        `json:"message"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if !resData.OK {
+		t.Fatalf("expected ok=true, got false")
+	}
+	if len(resData.Warnings) == 0 {
+		t.Fatalf("expected warnings in response, got none")
+	}
+	foundWarning := false
+	for _, w := range resData.Warnings {
+		if strings.Contains(w, "开机启动设置失败") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected warning to mention '开机启动设置失败', got %v", resData.Warnings)
+	}
+
+	// 1. Network listener MUST NOT have rolled back: proxy MUST listen on proxyPort2
+	conn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("network transaction was rolled back! proxy not listening on %d: %v", proxyPort2, err)
+	}
+	_ = conn2.Close()
+
+	// 2. Backend configuration semantics: AutoStart must be reconciled to false
+	if resData.Config.AutoStart != false {
+		t.Errorf("expected response config.AutoStart to be reconciled to false, got %v", resData.Config.AutoStart)
+	}
+	if resData.Config.ListenPort != proxyPort2 {
+		t.Errorf("expected response config.ListenPort to be %d, got %d", proxyPort2, resData.Config.ListenPort)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.AutoStart != false {
+		t.Errorf("expected cfgMgr.Get().AutoStart to be false, got true")
+	} else if activeCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected cfgMgr.Get().ListenPort to be %d, got %d", proxyPort2, activeCfg.ListenPort)
+	}
+
+	// 3. Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.AutoStart != false {
+		t.Errorf("expected disk config.AutoStart to be false, got %v", diskCfg.AutoStart)
+	}
+	if diskCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected disk config.ListenPort to be %d, got %d", proxyPort2, diskCfg.ListenPort)
+	}
+}
+
+func TestControlServer_ApplyConfig_DisablePACFailure_ReconcilesConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port: %v", err)
+	}
+	proxyPort := lProxy.Addr().(*net.TCPAddr).Port
+	_ = lProxy.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort
+		c.AutoSystemProxy = true
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.disablePACProxyFn = func(force bool) error {
+		return errors.New("simulated disable error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Apply disable auto_system_proxy
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := `{"auto_system_proxy": false}`
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(resData.Warnings) == 0 {
+		t.Fatalf("expected warnings, got none")
+	}
+	foundWarning := false
+	for _, w := range resData.Warnings {
+		if strings.Contains(w, "系统代理停用失败") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected warning to mention '系统代理停用失败', got %v", resData.Warnings)
+	}
+
+	// AutoSystemProxy must remain true because disabling failed
+	if resData.Config.AutoSystemProxy != true {
+		t.Errorf("expected response config.AutoSystemProxy to remain true, got %v", resData.Config.AutoSystemProxy)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.AutoSystemProxy != true {
+		t.Errorf("expected cfgMgr.Get().AutoSystemProxy to remain true, got false")
+	}
+
+	// Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.AutoSystemProxy != true {
+		t.Errorf("expected disk config.AutoSystemProxy to remain true, got %v", diskCfg.AutoSystemProxy)
+	}
+}
+
+func TestControlServer_ApplyConfig_BothPACAndStartupFail_DoesNotRollbackNetwork(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 1: %v", err)
+	}
+	proxyPort1 := lProxy1.Addr().(*net.TCPAddr).Port
+	_ = lProxy1.Close()
+
+	lProxy2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 2: %v", err)
+	}
+	proxyPort2 := lProxy2.Addr().(*net.TCPAddr).Port
+	_ = lProxy2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort1
+		c.AutoSystemProxy = false
+		c.AutoStart = false
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.enablePACProxyFn = func(url string) error {
+		return errors.New("simulated PAC error")
+	}
+	ctrl.setStartupEnabledFn = func(enabled bool) error {
+		return errors.New("simulated startup error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Apply port change to proxyPort2 AND enable both auto_system_proxy and auto_start
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := fmt.Sprintf(`{"listen_port": %d, "auto_system_proxy": true, "auto_start": true}`, proxyPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(resData.Warnings) != 2 {
+		t.Fatalf("expected 2 warnings, got %d: %v", len(resData.Warnings), resData.Warnings)
+	}
+
+	// 1. Network listener MUST NOT have rolled back: proxy MUST listen on proxyPort2
+	conn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("network transaction was rolled back! proxy not listening on %d: %v", proxyPort2, err)
+	}
+	_ = conn2.Close()
+
+	// 2. Both fields reconciled
+	if resData.Config.AutoSystemProxy != false || resData.Config.AutoStart != false {
+		t.Errorf("expected both fields false, got pac=%v startup=%v", resData.Config.AutoSystemProxy, resData.Config.AutoStart)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.ListenPort != proxyPort2 || activeCfg.AutoSystemProxy != false || activeCfg.AutoStart != false {
+		t.Errorf("cfgMgr mismatch: port=%d pac=%v startup=%v", activeCfg.ListenPort, activeCfg.AutoSystemProxy, activeCfg.AutoStart)
+	}
+
+	// 3. Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.ListenPort != proxyPort2 || diskCfg.AutoSystemProxy != false || diskCfg.AutoStart != false {
+		t.Errorf("disk config mismatch: port=%d pac=%v startup=%v", diskCfg.ListenPort, diskCfg.AutoSystemProxy, diskCfg.AutoStart)
+	}
+}
+
+func TestControlServer_ApplyConfig_PortChange_PACFailure_KeepsSystemProxyTrueAndNetworkActive(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 1: %v", err)
+	}
+	proxyPort1 := lProxy1.Addr().(*net.TCPAddr).Port
+	_ = lProxy1.Close()
+
+	lProxy2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 2: %v", err)
+	}
+	proxyPort2 := lProxy2.Addr().(*net.TCPAddr).Port
+	_ = lProxy2.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort1
+		c.AutoSystemProxy = true
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.enablePACProxyFn = func(url string) error {
+		return errors.New("simulated PAC error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Apply port change only (auto_system_proxy remains true)
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := fmt.Sprintf(`{"listen_port": %d}`, proxyPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(resData.Warnings) == 0 {
+		t.Fatalf("expected warnings, got none")
+	}
+	foundWarning := false
+	for _, w := range resData.Warnings {
+		if strings.Contains(w, "更新系统代理 PAC 地址失败") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected warning to mention '更新系统代理 PAC 地址失败', got %v", resData.Warnings)
+	}
+
+	// 1. Network listener MUST NOT have rolled back: proxy MUST listen on proxyPort2
+	conn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort2), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("network transaction was rolled back! proxy not listening on %d: %v", proxyPort2, err)
+	}
+	_ = conn2.Close()
+
+	// 2. Old port MUST be closed
+	connOld, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 200*time.Millisecond)
+	if err == nil {
+		_ = connOld.Close()
+		t.Errorf("proxy is still listening on old port %d", proxyPort1)
+	}
+
+	// 3. AutoSystemProxy MUST remain true (not flipped to false!) because OS proxy remains configured
+	if resData.Config.AutoSystemProxy != true {
+		t.Errorf("expected response config.AutoSystemProxy to remain true, got %v", resData.Config.AutoSystemProxy)
+	}
+	if resData.Config.ListenPort != proxyPort2 {
+		t.Errorf("expected response config.ListenPort to be %d, got %d", proxyPort2, resData.Config.ListenPort)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.AutoSystemProxy != true {
+		t.Errorf("expected cfgMgr.Get().AutoSystemProxy to remain true, got false")
+	} else if activeCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected cfgMgr.Get().ListenPort to be %d, got %d", proxyPort2, activeCfg.ListenPort)
+	}
+
+	// 4. Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.AutoSystemProxy != true {
+		t.Errorf("expected disk config.AutoSystemProxy to remain true, got %v", diskCfg.AutoSystemProxy)
+	}
+	if diskCfg.ListenPort != proxyPort2 {
+		t.Errorf("expected disk config.ListenPort to be %d, got %d", proxyPort2, diskCfg.ListenPort)
+	}
+}
+
+func TestControlServer_ApplyConfig_DisableStartupFailure_ReconcilesConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port: %v", err)
+	}
+	proxyPort := lProxy.Addr().(*net.TCPAddr).Port
+	_ = lProxy.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort
+		c.AutoStart = true
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	ctrl.setStartupEnabledFn = func(enabled bool) error {
+		return errors.New("simulated startup disable error")
+	}
+
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := `{"auto_start": false}`
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+	}
+
+	var resData struct {
+		OK       bool          `json:"ok"`
+		Config   config.Config `json:"config"`
+		Warnings []string      `json:"warnings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(resData.Warnings) == 0 {
+		t.Fatalf("expected warnings, got none")
+	}
+	foundWarning := false
+	for _, w := range resData.Warnings {
+		if strings.Contains(w, "开机启动停用失败") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Errorf("expected warning to mention '开机启动停用失败', got %v", resData.Warnings)
+	}
+
+	if resData.Config.AutoStart != true {
+		t.Errorf("expected response config.AutoStart to remain true, got %v", resData.Config.AutoStart)
+	}
+	if activeCfg := cfgMgr.Get(); activeCfg.AutoStart != true {
+		t.Errorf("expected cfgMgr.Get().AutoStart to remain true, got false")
+	}
+
+	// Verify config.json persistence on disk
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.AutoStart != true {
+		t.Errorf("expected disk config.AutoStart to remain true, got %v", diskCfg.AutoStart)
+	}
+}
+
+func TestControlServer_ApplyConfig_ProxyRebindFail_RollsBackConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.json")
+	cfgMgr := config.NewManager(cfgPath)
+
+	lC, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic control port: %v", err)
+	}
+	ctrlPort := lC.Addr().(*net.TCPAddr).Port
+	_ = lC.Close()
+
+	lProxy1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on dynamic proxy port 1: %v", err)
+	}
+	proxyPort1 := lProxy1.Addr().(*net.TCPAddr).Port
+	_ = lProxy1.Close()
+
+	// Occupy proxyPort2 with an active listener to force ReloadListener to fail
+	busyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on busy port: %v", err)
+	}
+	proxyPort2 := busyListener.Addr().(*net.TCPAddr).Port
+	defer busyListener.Close()
+
+	cfgMgr.Update(func(c *config.Config) {
+		c.ControlPort = ctrlPort
+		c.ListenPort = proxyPort1
+	})
+
+	stats := telemetry.NewStats()
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	proxySrv := proxy.NewProxyServer(cfgMgr, nil, cacheMgr, stats)
+	if err := proxySrv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer proxySrv.Stop()
+
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, proxySrv, stats)
+	if err := ctrl.Start(); err != nil {
+		t.Fatalf("failed to start control server: %v", err)
+	}
+	defer ctrl.Stop()
+
+	// Attempt to change listen_port to proxyPort2 (which is occupied)
+	applyURL := fmt.Sprintf("http://127.0.0.1:%d/api/config/apply", ctrlPort)
+	reqBody := fmt.Sprintf(`{"listen_port": %d}`, proxyPort2)
+	req, err := http.NewRequest(http.MethodPost, applyURL, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("apply request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 on rebind failure, got %d", resp.StatusCode)
+	}
+
+	// Verify rollback: proxy still listens on proxyPort1
+	conn1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort1), 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected proxy to still listen on original port %d, got: %v", proxyPort1, err)
+	}
+	_ = conn1.Close()
+
+	// Verify config rollback
+	if activeCfg := cfgMgr.Get(); activeCfg.ListenPort != proxyPort1 {
+		t.Fatalf("expected cfgMgr.Get().ListenPort to roll back to %d, got %d", proxyPort1, activeCfg.ListenPort)
+	}
+
+	// Verify config.json persistence on disk rolled back to proxyPort1
+	diskBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to read persisted config file: %v", err)
+	}
+	var diskCfg config.Config
+	if err := json.Unmarshal(diskBytes, &diskCfg); err != nil {
+		t.Fatalf("failed to parse persisted config file: %v", err)
+	}
+	if diskCfg.ListenPort != proxyPort1 {
+		t.Fatalf("expected disk config.ListenPort to roll back to %d, got %d", proxyPort1, diskCfg.ListenPort)
+	}
+}
+
+
+func TestCacheMaintenanceRejectsProtectedLegacyRoot(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("home directory unavailable")
+	}
+	tempDir := t.TempDir()
+	cfgMgr := config.NewManager(filepath.Join(tempDir, "config.json"))
+	cacheMgr := cache.NewManager(tempDir, 16)
+	defer cacheMgr.Close()
+	cacheMgr.SetCacheBase(filepath.Join(home, "Downloads"))
+	ctrl := NewControlServer(cfgMgr, nil, cacheMgr, nil, telemetry.NewStats())
+	tests := []struct {
+		name string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{"disk-clear", ctrl.handleCacheClear},
+		{"audit", ctrl.handleCacheAudit},
+		{"slim", ctrl.handleCacheSlim},
+		{"category-clear", ctrl.handleCacheClearCategory},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/cache/"+tc.name, nil)
+			w := httptest.NewRecorder()
+			tc.handler(w, req)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("expected HTTP 409, got %d: %s", w.Code, w.Body.String())
+			}
+			var payload map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["code"] != "CACHE_DIR_REQUIRES_RELOCATION" || payload["destructive_operations_blocked"] != true {
+				t.Fatalf("expected structured relocation response, got %+v", payload)
+			}
+		})
+	}
+}

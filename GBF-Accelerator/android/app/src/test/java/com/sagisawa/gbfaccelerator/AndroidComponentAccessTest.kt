@@ -10,8 +10,9 @@ import javax.xml.parsers.DocumentBuilderFactory
 /**
  * Static verification of the component access boundary declared in AndroidManifest.xml.
  *
- * Only the launcher activity may be reachable from other apps. The core service and the control
- * receiver are driven exclusively by explicit in-app intents, so they must stay unexported.
+ * Only the launcher activity and the system-bound Quick Settings tile service may be reachable from
+ * other apps. The core service and the control receiver are driven exclusively by explicit in-app
+ * intents, so they must stay unexported.
  */
 class AndroidComponentAccessTest {
 
@@ -81,29 +82,60 @@ class AndroidComponentAccessTest {
     }
 
     @Test
-    fun launcherActivityDeclaresNoControlActionFilter() {
+    fun launcherActivityDeclaresOnlyLauncherAndTilePreferenceFilters() {
         val activity = component("activity", "com.sagisawa.gbfaccelerator.ui.MainActivity")
         val actions = (0 until activity.getElementsByTagName("action").length)
             .map { activity.getElementsByTagName("action").item(it) as Element }
             .mapNotNull { attribute(it, "name") }
             .toSet()
         assertEquals(
-            "MainActivity must stay reachable only as the launcher entry point",
-            setOf("android.intent.action.MAIN"),
+            "MainActivity may only expose the launcher and Quick Settings preference actions",
+            setOf(
+                "android.intent.action.MAIN",
+                "android.service.quicksettings.action.QS_TILE_PREFERENCES",
+            ),
             actions,
         )
     }
 
     @Test
-    fun onlyTheLauncherActivityIsExported() {
+    fun quickSettingsTileIsProtectedBySystemPermission() {
+        val service = component("service", "com.sagisawa.gbfaccelerator.ui.ProxyTileService")
+        assertEquals(
+            "ProxyTileService must be exported for the system Quick Settings host",
+            "true",
+            attribute(service, "exported"),
+        )
+        assertEquals(
+            "ProxyTileService must only be bindable by the system tile host",
+            "android.permission.BIND_QUICK_SETTINGS_TILE",
+            attribute(service, "permission"),
+        )
+
+        val actions = (0 until service.getElementsByTagName("action").length)
+            .map { service.getElementsByTagName("action").item(it) as Element }
+            .mapNotNull { attribute(it, "name") }
+            .toSet()
+        assertEquals(
+            "ProxyTileService must expose only the Quick Settings tile action",
+            setOf("android.service.quicksettings.action.QS_TILE"),
+            actions,
+        )
+    }
+
+    @Test
+    fun onlyTheLauncherAndTileServiceAreExported() {
         val exported = listOf("activity", "service", "receiver", "provider").flatMap { tag ->
             components(tag)
                 .filter { attribute(it, "exported") == "true" }
                 .map { "$tag:${attribute(it, "name")}" }
         }
         assertEquals(
-            "only the launcher activity may be exported",
-            listOf("activity:com.sagisawa.gbfaccelerator.ui.MainActivity"),
+            "only the launcher activity and the system tile service may be exported",
+            listOf(
+                "activity:com.sagisawa.gbfaccelerator.ui.MainActivity",
+                "service:com.sagisawa.gbfaccelerator.ui.ProxyTileService",
+            ),
             exported,
         )
     }

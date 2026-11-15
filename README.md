@@ -4,6 +4,8 @@ GBF Cache 是一个 Android 端的《Granblue Fantasy》静态资源缓存加速
 
 > 当前仓库处于开发阶段。构建方式见 [BUILD.md](BUILD.md)，架构与实现细节见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
+> **SkyLeap 不支持**：当前单 App 版不支持 `com.dena.skyleap`。SkyLeap 不信任用户安装的 CA，单 App 无法强制其信任；TLS 握手失败会导致白屏。请使用实测信任用户 CA 的浏览器，或让 SkyLeap 直连（不加速）。原因见下文「SkyLeap 不支持」。
+
 ## 目标
 
 - 只接管选中的浏览器流量，其他 App 直连。
@@ -30,13 +32,14 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 
 ## 功能
 
-- 系统级 VPN 分流，覆盖 WebView 浏览器。
+- 系统级 VPN 分流，覆盖实测信任用户 CA 的 WebView 浏览器。
 - 只代理已勾选浏览器；App 自身和其他 App 直连。
 - 内置 GBF 域名规则，无需导入 FlClash 配置。
 - 静态素材磁盘缓存、缓存命中统计、缓存清理。
 - 可选 RAM 缓存和预取（移动端默认关闭）。
 - QUIC/UDP 443 拦截，强制回退到 TCP，保证缓存生效。
 - 本地 CA 证书安装入口。
+- 系统快捷设置磁贴，一键启停代理核心。
 - 保留原有完整 UI：状态、浏览器、缓存、性能、指标、日志。
 
 ## 环境要求
@@ -45,6 +48,7 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 - arm64-v8a 设备。
 - 首次开启 VPN 时系统会要求授权。
 - 浏览器需要信任本地 CA 证书，才能正常访问 HTTPS GBF 资源。
+- SkyLeap（`com.dena.skyleap`）不支持，原因见下文「SkyLeap 不支持」。
 
 ## 安装与使用
 
@@ -52,8 +56,9 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 2. 打开 App，点击“启动代理核心”，在系统弹窗中授权 VPN。
 3. 等待状态依次显示 STARTING、RUNNING，代理徽章显示 VPN ACTIVE。
 4. 点击“安装 CA 证书”，按系统提示把证书安装为用户 CA。
-5. 在浏览器列表中勾选目标浏览器；可点击对应行的“打开”，也可从桌面打开。
+5. 在浏览器列表中勾选目标浏览器（不要勾选 SkyLeap）；可点击对应行的“打开”，也可从桌面打开。
 6. 回到 App 查看缓存命中、磁盘命中、日志等指标。
+7. 可将“GBF Cache”添加到系统快捷设置，用于一键启停；首次使用前仍需在 App 内完成 VPN 授权和浏览器选择。
 
 ## CA 证书
 
@@ -68,12 +73,29 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 
 App 会自动发现可处理 `https` 链接的已安装浏览器，并以复选框列表展示：
 
-- 首次运行默认勾选全部已发现浏览器。
+- 首次运行默认勾选全部已发现浏览器；SkyLeap 即使被默认勾选，也应手动取消。
 - 可同时勾选多个浏览器；勾选结果会保存。
-- SkyLeap（`com.dena.skyleap`）即使未被系统查询返回，也会作为显式候选列出。
+- SkyLeap（`com.dena.skyleap`）即使未被系统查询返回，也会作为显式候选列出，但当前不支持，不应勾选；原因见下节。
 - 未勾选的 App 不经过 VPN，保持直连。
 - App 自身和 GBF core 永远不会加入 allowlist。
 - VPN 运行期间修改勾选，需要重启 VPN 后生效。
+
+## SkyLeap 不支持
+
+当前单 App 版不支持 SkyLeap（`com.dena.skyleap`）。
+
+原因：
+
+- SkyLeap 的 WebView/网络栈不信任用户安装的 CA；单 App 无法向其他应用注入信任配置。
+- GBF 域名被分流到 GBF core 后，core 使用本地 CA 终止 TLS；SkyLeap 拒绝该 CA，握手失败，表现为白屏或无提示。
+- 让 SkyLeap 信任该 CA 需要修改 SkyLeap（LSPatch/重打包）或把 CA 安装为系统 CA（Root）。这两种方式不在单 App 支持范围内，并可能带来客户端完整性、更新和账号风险。
+
+可行替代：
+
+- 使用 Chrome、Via 或其他实测信任用户 CA 的浏览器。
+- 如需继续使用官方 SkyLeap，请将其从 VPN allowlist 中移除，让它直连；此时没有缓存加速。
+
+> 上游 `GBF-Accelerator/README*.md` 中的 SkyLeap 修补/LSPosed 说明属于上游或历史方案，不适用于本单 App 版。
 
 ## 缓存说明
 
@@ -104,6 +126,7 @@ App 会自动发现可处理 `https` 链接的已安装浏览器，并以复选�
 - 确认 CA 已安装为用户 CA 并在系统设置中启用。
 - 确认系统时间正确。
 - 重新安装 CA 后重启浏览器。
+- 如果浏览器是 SkyLeap：当前不支持，见上文「SkyLeap 不支持」；不要通过修改 SkyLeap 或 Root 来规避，相关方式不在支持范围内。
 
 ### 缓存命中不增长
 
@@ -126,7 +149,7 @@ App 会自动发现可处理 `https` 链接的已安装浏览器，并以复选�
 
 - 在 App 内勾选其他信任用户 CA 的浏览器。
 - 在系统设置中确认 CA 已安装并启用。
-- 如果仍失败，需要浏览器补丁或 Xposed 方案，单 App 不包含该能力。
+- 如果仍失败，需要浏览器补丁或 Xposed 方案；这些方案不在单 App 支持范围内。
 
 ## 安全与隐私
 

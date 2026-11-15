@@ -245,7 +245,7 @@ GBF-Accelerator/android/app/build/outputs/apk/debug/app-debug.apk
 建议重命名：
 
 ```powershell
-Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\..\dist\GBF-Cache-0.1.2-arm64-debug.apk" -Force
+Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\..\dist\GBF-Cache-0.1.3.apk" -Force
 ```
 
 ## 8. 校验 APK

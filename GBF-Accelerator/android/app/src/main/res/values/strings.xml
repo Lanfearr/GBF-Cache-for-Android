@@ -16,6 +16,15 @@
     <string name="btn_start_proxy">启动代理核心</string>
     <string name="btn_stop_proxy">停止代理核心</string>
 
+    <!-- Quick Settings Tile -->
+    <string name="qs_tile_label">GBF Cache</string>
+    <string name="qs_tile_subtitle_running">已启动</string>
+    <string name="qs_tile_subtitle_stopped">已停止</string>
+    <string name="qs_tile_subtitle_starting">启动中</string>
+    <string name="qs_tile_subtitle_stopping">停止中</string>
+    <string name="qs_tile_subtitle_error">启动失败</string>
+    <string name="qs_tile_vpn_permission">请先在 App 内授权 VPN</string>
+
     <!-- Browser Section -->
     <string name="section_browser_title">浏览器代理范围</string>
     <string name="browser_scanning">正在扫描已安装浏览器...</string>
@@ -27,16 +36,9 @@
     <string name="browser_refreshed">已刷新浏览器列表</string>
     <string name="browser_open">打开</string>
     <string name="btn_refresh_browsers">刷新浏览器列表</string>
-    <string name="browser_patched_hint">VPN 模式无需 LSPatch。首次使用请先启动核心并安装 CA 证书；勾选的浏览器流量会进入 GBF，未勾选应用保持直连。浏览器是否信任用户 CA 取决于其 WebView/网络栈。</string>
     <string name="ca_status_unknown">CA 证书：尚未生成（启动核心后自动生成）</string>
     <string name="btn_install_ca">安装 CA 证书</string>
     <string name="btn_export_ca">导出 CA 证书</string>
-
-    <!-- Patch Engine Guidance -->
-    <string name="section_patch_title">旧版 Patch 指引（单 App 模式不需要）</string>
-    <string name="patch_pipeline_standby">单 App VPN 模式</string>
-    <string name="patch_pipeline_notice">当前单 App 版本使用系统 VpnService，无需 LSPatch/Xposed；此区块仅保留旧版 PC Patch 流程说明。</string>
-    <string name="patch_pipeline_steps">单 App 使用流程：\n1. 点击“启动代理核心”，等待状态变为 RUNNING；\n2. 点击“安装 CA 证书”，按系统提示安装用户 CA；\n3. 授权系统 VPN 请求；\n4. 打开任一已勾选浏览器开始游戏。</string>
 
     <!-- Cache Management -->
     <string name="section_cache_mgmt_title">静态缓存管理与维护</string>

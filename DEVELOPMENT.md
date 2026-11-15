@@ -18,6 +18,7 @@
 - CMFA core 的 JNI 包名固定为 `com.github.kr328.clash.core.bridge`，不能改。
 - CMFA core 为 GPL-3.0。
 - 浏览器是否信任用户 CA 由其 WebView/网络栈决定，单 App 不能强制。
+- SkyLeap（`com.dena.skyleap`）不在支持范围：其 WebView/网络栈不信任用户 CA，单 App 无法注入信任配置；修改 SkyLeap 或 Root/系统 CA 不属于本方案。
 - 单 App 与 GBF core 子进程同 UID，必须通过 per-app allowlist 排除自身，避免回环。
 
 ## 2. 总体架构
@@ -119,14 +120,13 @@ CMFA 的 `TunService` 会：
 
 ### 4.3 保留上游完整 UI
 
-不删除原有 6 个区块：
+保留原有 5 个区块：
 
 1. Core/Proxy 状态
 2. 目标浏览器
-3. Patch 指引
-4. 缓存管理
-5. 性能偏好
-6. 指标与日志
+3. 缓存管理
+4. 性能偏好
+5. 指标与日志
 
 状态卡片复用原有代理徽章显示 VPN 状态；`CoreService` 现在同时承担 Go Core 子进程管理和 VpnService TUN 生命周期。
 
@@ -138,7 +138,7 @@ CMFA 的 `TunService` 会：
 - App 自身和 GBF core 自动绕过。
 - 避免全局 VPN 带来的兼容性和回环问题。
 
-`BrowserCatalog` 通过 `Intent.ACTION_VIEW` + `https` + `CATEGORY_BROWSABLE` 查询浏览器，并以复选框列表展示。首次运行默认全选，选择结果保存在 `AppPreferences`。VPN 运行期间修改选择，需要重启 VPN 后生效。
+`BrowserCatalog` 通过 `Intent.ACTION_VIEW` + `https` + `CATEGORY_BROWSABLE` 查询浏览器，并以复选框列表展示。首次运行默认全选，选择结果保存在 `AppPreferences`。VPN 运行期间修改选择，需要重启 VPN 后生效。SkyLeap 会被显式列为候选，但当前不支持；首次默认全选时需手动取消。
 
 ### 4.5 预编译原生库
 
@@ -150,6 +150,17 @@ CMFA release APK 已包含 arm64 的 `libclash.so` 和 `libbridge.so`。直接�
 - 处理 CMFA 的 `golang-android` 插件。
 
 代价是需要校验 16KB 页对齐；不合格时再从源码重建。
+
+### 4.6 快捷设置磁贴
+
+`ProxyTileService` 继承 `TileService`，提供系统快捷设置中的一键启停入口：
+
+- 运行中或启动中点击磁贴，调用 `CoreService.stop`。
+- 已停止或崩溃时点击磁贴，先检查已安装/已选浏览器与 `VpnService.prepare`。
+- VPN 未授权或没有已选浏览器时，显示提示并打开 `MainActivity`，由主界面完成授权或选择。
+- 磁贴状态来自 `CoreManager.currentState` 与 `VpnController.state`；`RUNNING` 且 VPN `RUNNING` 时显示为激活。
+- `onStartListening` 注册状态监听，`onStopListening` 移除监听。
+- Manifest 使用 `android.permission.BIND_QUICK_SETTINGS_TILE` 限制绑定方，并只暴露 `android.service.quicksettings.action.QS_TILE`。
 
 ## 5. 代码结构
 
@@ -164,8 +175,9 @@ android/app/src/main/java/com/sagisawa/gbfaccelerator/
 ├─ cert/
 │  └─ CaCertManager.kt            # 原有：CA 检测/安装/导出
 ├─ ui/
-│  └─ MainActivity.kt             # 修改：VPN 权限、CA 按钮
-└─ patch/                         # 原有：浏览器启动/补丁指引
+│  ├─ MainActivity.kt             # 修改：VPN 权限、CA 按钮
+│  └─ ProxyTileService.kt         # 新增：快捷设置磁贴
+└─ patch/                         # 原有：浏览器发现/启动
 ```
 
 ### 5.1 `GbfApplication`
@@ -440,3 +452,16 @@ $bt = "$env:LOCALAPPDATA\Android\Sdk\build-tools\35.0.0"
 - `CoreService` 停止与 `Clash.load()` 的并发时序需要真机压力测试。
 - `common` AAR 会注入 `com.sagisawa.gbfaccelerator.permission.RECEIVE_BROADCASTS`，当前无害。
 - 浏览器发现依赖系统 `https` Intent 解析；未声明标准浏览 Intent 的 App 可能不会出现在列表中。
+
+## 11. SkyLeap 不支持
+
+当前单 App 版不支持 SkyLeap（`com.dena.skyleap`）。
+
+原因：
+
+- SkyLeap 的 WebView/网络栈不信任用户安装的 CA；其信任锚由 SkyLeap 自身决定，GBF Cache 无法强制。
+- `gbf.game.mbga.jp` 等 GBF 域名被分流到 GBF core 后，core 使用本地 CA 终止 TLS；SkyLeap 拒绝该 CA，握手失败，表现为白屏或无提示。
+- 单 App 不包含 LSPatch/Xposed，也没有 Root 系统 CA 安装能力，因此不能为 SkyLeap 增加信任锚。
+- 修改 SkyLeap 或使用 Root/系统 CA 不属于当前支持范围，并涉及客户端完整性、更新和账号风险。
+
+若只需 SkyLeap 可用，请将其从 VPN allowlist 移除，让它直连；此时没有缓存加速。替代方案是使用实测信任用户 CA 的浏览器（如 Chrome、Via）。

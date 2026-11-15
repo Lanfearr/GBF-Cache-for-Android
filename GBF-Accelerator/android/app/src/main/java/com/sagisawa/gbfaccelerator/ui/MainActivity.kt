@@ -11,78 +11,38 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
-import android.view.Gravity
 import android.view.View
-import android.widget.Button
-import android.widget.CheckBox
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.widget.SwitchCompat
 import androidx.core.content.ContextCompat
 import com.sagisawa.gbfaccelerator.R
-import com.sagisawa.gbfaccelerator.cert.CaCertManager
-import com.sagisawa.gbfaccelerator.core.AppPreferences
+import com.sagisawa.gbfaccelerator.core.CacheStats
 import com.sagisawa.gbfaccelerator.core.CoreManager
 import com.sagisawa.gbfaccelerator.core.CoreService
 import com.sagisawa.gbfaccelerator.core.VpnController
 import com.sagisawa.gbfaccelerator.patch.BrowserCatalog
-import com.sagisawa.gbfaccelerator.patch.BrowserLauncher
-import com.sagisawa.gbfaccelerator.patch.BrowserTarget
-import com.sagisawa.gbfaccelerator.patch.DefaultBrowserLauncher
-import com.sagisawa.gbfaccelerator.patch.InstalledBrowser
-import com.sagisawa.gbfaccelerator.patch.LaunchResult
-import org.json.JSONObject
-import java.io.File
-import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
-    // 1. Status Section
-    private lateinit var tvStatusBadge: TextView
-    private lateinit var tvProxyBadge: TextView
-    private lateinit var tvProxyDetail: TextView
-    private lateinit var tvPidUptime: TextView
-    private lateinit var tvPorts: TextView
-    private lateinit var btnToggleService: Button
+    private lateinit var cardCore: LinearLayout
+    private lateinit var ivCoreIcon: ImageView
+    private lateinit var tvCoreTitle: TextView
+    private lateinit var tvCoreSubtitle: TextView
+    private lateinit var tvCoreDetail: TextView
 
-    // 2. Browser Management Section
-    private lateinit var tvBrowserStatus: TextView
-    private lateinit var llBrowserList: LinearLayout
-    private lateinit var btnRefreshBrowsers: Button
-    private lateinit var tvCaStatus: TextView
-    private lateinit var btnInstallCa: Button
-    private lateinit var btnExportCa: Button
-
-    // 3. Cache Management & Maintenance Section
-    private lateinit var tvCacheSummaryInline: TextView
-    private lateinit var btnOpenCacheDir: Button
-    private lateinit var btnSlimCache: Button
-    private lateinit var btnClearCache: Button
-
-    // 4. Performance & Cache Preferences Section
-    private lateinit var switchRamCache: SwitchCompat
-    private lateinit var switchPrefetch: SwitchCompat
-
-    // 5. Metrics Section
+    private lateinit var cardMetrics: LinearLayout
+    private lateinit var tvMetricPid: TextView
     private lateinit var tvMetricRamCache: TextView
     private lateinit var tvMetricHits: TextView
     private lateinit var tvMetricRequests: TextView
     private lateinit var tvMetricReuse: TextView
 
-    // 6. Logs Section
-    private lateinit var svLogs: ScrollView
-    private lateinit var tvLogContent: TextView
-    private lateinit var tvClearLogs: TextView
-
-    private val browserLauncher: BrowserLauncher = DefaultBrowserLauncher()
-    private var availableBrowsers: List<InstalledBrowser> = emptyList()
-    private val selectedBrowserPackages = linkedSetOf<String>()
+    private lateinit var tvBrowserSummary: TextView
+    private lateinit var tvCacheSummary: TextView
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -95,12 +55,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val stateListener: (CoreManager.State) -> Unit = { state ->
-        runOnUiThread {
-            updateStateUi(state)
-            if (state == CoreManager.State.RUNNING) {
-                updateCaUi()
-            }
-        }
+        runOnUiThread { updateStateUi(state) }
     }
 
     private val vpnListener: (VpnController.State, String?) -> Unit = { _, _ ->
@@ -109,10 +64,6 @@ class MainActivity : AppCompatActivity() {
 
     private val metricsListener: (CoreManager.CoreMetrics) -> Unit = { metrics ->
         runOnUiThread { updateMetricsUi(metrics) }
-    }
-
-    private val logListener: (String) -> Unit = { _ ->
-        runOnUiThread { renderLogs() }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -127,21 +78,19 @@ class MainActivity : AppCompatActivity() {
 
         CoreManager.addStateListener(stateListener)
         CoreManager.addMetricsListener(metricsListener)
-        CoreManager.addLogListener(logListener)
         VpnController.addListener(vpnListener)
 
-        renderLogs()
         updateCacheSummary()
         requestNotificationPermission()
     }
 
     override fun onResume() {
         super.onResume()
-        refreshBrowserList()
-        updateCaUi()
-        updateVpnUi()
+        updateBrowserSummary()
         updateCacheSummary()
-        updatePreferencesUi()
+        updateStateUi(CoreManager.currentState)
+        updateVpnUi()
+        updateMetricsUi(CoreManager.currentMetrics)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -150,128 +99,66 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initViews() {
-        // 1. Status Section
-        tvStatusBadge = findViewById(R.id.tv_status_badge)
-        tvProxyBadge = findViewById(R.id.tv_proxy_badge)
-        tvProxyDetail = findViewById(R.id.tv_proxy_detail)
-        tvPidUptime = findViewById(R.id.tv_pid_uptime)
-        tvPorts = findViewById(R.id.tv_ports)
-        btnToggleService = findViewById(R.id.btn_toggle_service)
+        cardCore = findViewById(R.id.card_core)
+        ivCoreIcon = findViewById(R.id.iv_core_icon)
+        tvCoreTitle = findViewById(R.id.tv_core_title)
+        tvCoreSubtitle = findViewById(R.id.tv_core_subtitle)
+        tvCoreDetail = findViewById(R.id.tv_core_detail)
 
-        // 2. Browser Management Section
-        tvBrowserStatus = findViewById(R.id.tv_browser_status)
-        llBrowserList = findViewById(R.id.ll_browser_list)
-        btnRefreshBrowsers = findViewById(R.id.btn_refresh_browsers)
-        tvCaStatus = findViewById(R.id.tv_ca_status)
-        btnInstallCa = findViewById(R.id.btn_install_ca)
-        btnExportCa = findViewById(R.id.btn_export_ca)
-
-        // 3. Cache Management & Maintenance Section
-        tvCacheSummaryInline = findViewById(R.id.tv_cache_summary_inline)
-        btnOpenCacheDir = findViewById(R.id.btn_open_cache_dir)
-        btnSlimCache = findViewById(R.id.btn_slim_cache)
-        btnClearCache = findViewById(R.id.btn_clear_cache)
-
-        // 4. Performance & Cache Preferences Section
-        switchRamCache = findViewById(R.id.switch_ram_cache)
-        switchPrefetch = findViewById(R.id.switch_prefetch)
-
-        // 5. Metrics Section
+        cardMetrics = findViewById(R.id.card_metrics)
+        tvMetricPid = findViewById(R.id.tv_metric_pid)
         tvMetricRamCache = findViewById(R.id.tv_metric_ram_cache)
         tvMetricHits = findViewById(R.id.tv_metric_hits)
         tvMetricRequests = findViewById(R.id.tv_metric_requests)
         tvMetricReuse = findViewById(R.id.tv_metric_reuse)
 
-        // 6. Logs Section
-        svLogs = findViewById(R.id.sv_logs)
-        tvLogContent = findViewById(R.id.tv_log_content)
-        tvClearLogs = findViewById(R.id.tv_clear_logs)
+        tvBrowserSummary = findViewById(R.id.tv_browser_summary)
+        tvCacheSummary = findViewById(R.id.tv_cache_summary)
 
-        setupServiceToggle()
-        setupBrowserList()
-        setupCertActions()
-        setupCacheActions()
-        setupPreferences()
-
-        tvClearLogs.setOnClickListener {
-            tvLogContent.text = ""
+        cardCore.setOnClickListener { toggleCore() }
+        findViewById<View>(R.id.card_browser).setOnClickListener {
+            startActivity(Intent(this, BrowserScopeActivity::class.java))
+        }
+        findViewById<View>(R.id.card_cache).setOnClickListener {
+            startActivity(Intent(this, CacheManagementActivity::class.java))
+        }
+        findViewById<View>(R.id.btn_logs).setOnClickListener {
+            startActivity(Intent(this, LogsActivity::class.java))
+        }
+        findViewById<View>(R.id.btn_certificate).setOnClickListener {
+            startActivity(Intent(this, CertificateActivity::class.java))
+        }
+        findViewById<View>(R.id.btn_settings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        findViewById<View>(R.id.btn_help).setOnClickListener {
+            startActivity(Intent(this, HelpActivity::class.java))
+        }
+        findViewById<View>(R.id.btn_about).setOnClickListener {
+            startActivity(Intent(this, AboutActivity::class.java))
         }
     }
 
-    private fun updatePreferencesUi() {
-        val ramPref = AppPreferences.isRamCacheEnabled(this)
-        if (switchRamCache.isChecked != ramPref) {
-            switchRamCache.isChecked = ramPref
-        }
-        val prefetchPref = AppPreferences.isPrefetchEnabled(this)
-        if (switchPrefetch.isChecked != prefetchPref) {
-            switchPrefetch.isChecked = prefetchPref
-        }
-    }
-
-    private fun setupPreferences() {
-        updatePreferencesUi()
-
-        switchRamCache.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked != AppPreferences.isRamCacheEnabled(this)) {
-                AppPreferences.setRamCacheEnabled(this, isChecked)
-                updateConfigJsonPreference("enable_ram_cache", isChecked)
-                if (CoreManager.currentState == CoreManager.State.RUNNING) {
-                    CoreManager.applyRuntimeConfig(mapOf("enable_ram_cache" to isChecked))
-                }
-            }
-        }
-
-        switchPrefetch.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked != AppPreferences.isPrefetchEnabled(this)) {
-                AppPreferences.setPrefetchEnabled(this, isChecked)
-                updateConfigJsonPreference("enable_prefetch", isChecked)
-                if (CoreManager.currentState == CoreManager.State.RUNNING) {
-                    CoreManager.applyRuntimeConfig(mapOf("enable_prefetch" to isChecked))
-                }
-            }
-        }
-    }
-
-    private fun updateConfigJsonPreference(key: String, value: Any) {
-        try {
-            val configFile = File(filesDir, "config.json")
-            val json = if (configFile.exists()) {
-                JSONObject(configFile.readText())
-            } else {
-                JSONObject()
-            }
-            json.put(key, value)
-            configFile.writeText(json.toString(2))
-        } catch (e: Throwable) {
-            Log.w("MainActivity", "Failed to update config.json with $key=$value: ${e.message}")
-        }
-    }
-
-    private fun setupServiceToggle() {
-        btnToggleService.setOnClickListener {
-            when (CoreManager.currentState) {
-                CoreManager.State.RUNNING, CoreManager.State.STARTING -> {
-                    CoreService.stop(this)
-                }
-                CoreManager.State.STOPPED, CoreManager.State.CRASHED -> {
-                    requestStartVpn()
-                }
-                CoreManager.State.STOPPING -> {
-                    // Ignored while stopping
-                }
-            }
+    private fun toggleCore() {
+        when (CoreManager.currentState) {
+            CoreManager.State.RUNNING, CoreManager.State.STARTING -> CoreService.stop(this)
+            CoreManager.State.STOPPED, CoreManager.State.CRASHED -> requestStartVpn()
+            CoreManager.State.STOPPING -> Unit
         }
     }
 
     private fun requestStartVpn() {
-        if (availableBrowsers.isEmpty()) {
+        val installedBrowsers = BrowserCatalog.discover(this)
+        if (installedBrowsers.isEmpty()) {
             Toast.makeText(this, R.string.browser_none_installed, Toast.LENGTH_LONG).show()
             return
         }
-        val installedPackages = availableBrowsers.mapTo(mutableSetOf()) { it.packageName }
-        if (selectedBrowserPackages.none { it in installedPackages }) {
+
+        val installedPackages = installedBrowsers.mapTo(mutableSetOf()) { it.packageName }
+        val selectedPackages = BrowserCatalog.resolveSelectedPackages(this, installedBrowsers)
+        if (selectedPackages.none { it in installedPackages }) {
             Toast.makeText(this, R.string.browser_none_selected, Toast.LENGTH_LONG).show()
+            startActivity(Intent(this, BrowserScopeActivity::class.java))
             return
         }
 
@@ -283,354 +170,132 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupBrowserList() {
-        btnRefreshBrowsers.setOnClickListener {
-            refreshBrowserList(showToast = true)
-        }
-    }
-
-    private fun refreshBrowserList(showToast: Boolean = false) {
-        availableBrowsers = BrowserCatalog.discover(this)
-        selectedBrowserPackages.clear()
-        selectedBrowserPackages.addAll(BrowserCatalog.resolveSelectedPackages(this, availableBrowsers))
-        renderBrowserList()
-        if (showToast) {
-            Toast.makeText(this, R.string.browser_refreshed, Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun renderBrowserList() {
-        llBrowserList.removeAllViews()
-        if (availableBrowsers.isEmpty()) {
-            tvBrowserStatus.text = getString(R.string.browser_none_installed)
-            return
-        }
-        availableBrowsers.forEach { browser ->
-            llBrowserList.addView(createBrowserRow(browser))
-        }
-        updateBrowserSummary()
-    }
-
-    private fun createBrowserRow(browser: InstalledBrowser): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
-        }
-
-        val checkBox = CheckBox(this).apply {
-            isChecked = browser.packageName in selectedBrowserPackages
-            contentDescription = browser.label
-            setOnCheckedChangeListener { _, isChecked ->
-                if (isChecked) {
-                    selectedBrowserPackages.add(browser.packageName)
-                } else {
-                    selectedBrowserPackages.remove(browser.packageName)
-                }
-                BrowserCatalog.saveSelectedPackages(this@MainActivity, selectedBrowserPackages)
-                updateBrowserSummary()
-            }
-        }
-
-        val icon = ImageView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28))
-            setImageDrawable(
-                runCatching { packageManager.getApplicationIcon(browser.packageName) }.getOrNull()
-            )
-        }
-
-        val textContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setPadding(dp(8), 0, dp(8), 0)
-        }
-        textContainer.addView(TextView(this).apply {
-            text = browser.label
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
-            textSize = 13f
-        })
-        textContainer.addView(TextView(this).apply {
-            text = browser.packageName
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
-            textSize = 11f
-        })
-
-        val openButton = Button(this).apply {
-            text = getString(R.string.browser_open)
-            textSize = 11f
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(8), 0, dp(8), 0)
-            setOnClickListener { launchBrowser(browser) }
-        }
-
-        row.addView(checkBox)
-        row.addView(icon)
-        row.addView(textContainer)
-        row.addView(openButton)
-        row.setOnClickListener { checkBox.toggle() }
-        return row
-    }
-
     private fun updateBrowserSummary() {
-        if (availableBrowsers.isEmpty()) {
-            tvBrowserStatus.text = getString(R.string.browser_none_installed)
+        val browsers = BrowserCatalog.discover(this)
+        if (browsers.isEmpty()) {
+            tvBrowserSummary.setText(R.string.browser_none_installed)
             return
         }
-        val installedPackages = availableBrowsers.mapTo(mutableSetOf()) { it.packageName }
-        val selectedCount = selectedBrowserPackages.count { it in installedPackages }
-        tvBrowserStatus.text = if (
-            CoreManager.currentState == CoreManager.State.RUNNING ||
-            VpnController.state == VpnController.State.RUNNING ||
-            VpnController.state == VpnController.State.STARTING
-        ) {
-            getString(
-                R.string.browser_selected_count_with_restart,
-                selectedCount,
-                availableBrowsers.size,
-                getString(R.string.browser_restart_required)
-            )
-        } else {
-            getString(R.string.browser_selected_count, selectedCount, availableBrowsers.size)
-        }
-    }
-
-    private fun launchBrowser(browser: InstalledBrowser) {
-        launchTargetBrowser(
-            BrowserTarget(
-                id = browser.packageName,
-                name = browser.label,
-                targetPackages = setOf(browser.packageName)
-            )
+        val installedPackages = browsers.mapTo(mutableSetOf()) { it.packageName }
+        val selectedCount = BrowserCatalog.resolveSelectedPackages(this, browsers)
+            .count { it in installedPackages }
+        tvBrowserSummary.text = getString(
+            R.string.browser_selected_count,
+            selectedCount,
+            browsers.size
         )
-    }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private fun setupCertActions() {
-        btnInstallCa.setOnClickListener {
-            val intent = CaCertManager.createInstallIntent(this)
-            if (intent == null) {
-                Toast.makeText(this, "CA 证书尚未生成，请先启动代理核心", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
-            }
-            try {
-                startActivity(intent)
-            } catch (e: Throwable) {
-                Toast.makeText(this, "无法打开证书安装界面: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }
-
-        btnExportCa.setOnClickListener {
-            Thread {
-                val (success, message) = CaCertManager.exportCaCertToDownloads(this)
-                runOnUiThread {
-                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-                    if (success) updateCaUi()
-                }
-            }.start()
-        }
-    }
-
-    private fun updateCaUi() {
-        Thread {
-            val info = CaCertManager.getCertInfo(this)
-            val text = if (!info.exists) {
-                getString(R.string.ca_status_unknown)
-            } else {
-                val trust = if (info.isTrustedInSystem) "已信任" else "未信任"
-                "CA 证书：$trust | ${info.subject}"
-            }
-            runOnUiThread { tvCaStatus.text = text }
-        }.start()
-    }
-
-    private fun getGbfCacheDir(): File {
-        return File(filesDir, "cache/gbf/https")
-    }
-
-    private fun getDirStats(dir: File): Pair<Int, Long> {
-        var count = 0
-        var size = 0L
-        if (dir.exists() && dir.isDirectory) {
-            dir.walkTopDown().forEach { file ->
-                if (file.isFile) {
-                    count++
-                    size += file.length()
-                }
-            }
-        }
-        return Pair(count, size)
-    }
-
-    private fun formatSize(bytes: Long): String {
-        val mb = bytes.toDouble() / (1024 * 1024)
-        return if (mb >= 1024) {
-            String.format(Locale.US, "%.2f GB", mb / 1024.0)
-        } else {
-            String.format(Locale.US, "%.1f MB", mb)
-        }
     }
 
     private fun updateCacheSummary() {
         Thread {
-            val (count, sizeBytes) = getDirStats(getGbfCacheDir())
-            val sizeStr = formatSize(sizeBytes)
+            val cacheDir = CacheStats.cacheDir(this)
+            val (count, sizeBytes) = CacheStats.getStats(cacheDir)
+            val sizeStr = CacheStats.formatSize(sizeBytes)
             runOnUiThread {
-                tvCacheSummaryInline.text = "本地缓存: $count 个文件 | 占用 $sizeStr"
+                tvCacheSummary.text = getString(R.string.cache_summary_format, count, sizeStr)
             }
         }.start()
     }
 
-    private fun setupCacheActions() {
-        btnOpenCacheDir.setOnClickListener {
-            val cacheDir = getGbfCacheDir()
-            Thread {
-                val (count, sizeBytes) = getDirStats(cacheDir)
-                val sizeStr = formatSize(sizeBytes)
-                val path = cacheDir.absolutePath
-
-                runOnUiThread {
-                    val summaryText = getString(R.string.cache_dir_summary, path, count, sizeStr)
-                    AlertDialog.Builder(this)
-                        .setTitle(R.string.cache_dir_dialog_title)
-                        .setMessage(summaryText)
-                        .setPositiveButton(R.string.cache_copy_path) { _, _ ->
-                            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-                            val clip = android.content.ClipData.newPlainText("GBF Cache Path", path)
-                            clipboard?.setPrimaryClip(clip)
-                            Toast.makeText(this, "缓存路径已复制到剪贴板", Toast.LENGTH_SHORT).show()
-                        }
-                        .setNeutralButton(R.string.cache_export_download) { _, _ ->
-                            exportCacheToDownload(cacheDir)
-                        }
-                        .setNegativeButton("关闭", null)
-                        .show()
-                }
-            }.start()
+    private fun updateStateUi(state: CoreManager.State) {
+        val titleRes = when (state) {
+            CoreManager.State.STOPPED -> R.string.core_state_stopped
+            CoreManager.State.STARTING -> R.string.core_state_starting
+            CoreManager.State.RUNNING -> R.string.core_state_running
+            CoreManager.State.CRASHED -> R.string.core_state_crashed
+            CoreManager.State.STOPPING -> R.string.core_state_stopping
+        }
+        val hintRes = when (state) {
+            CoreManager.State.STOPPED -> R.string.core_hint_start
+            CoreManager.State.STARTING -> R.string.core_hint_starting
+            CoreManager.State.RUNNING -> R.string.core_hint_stop
+            CoreManager.State.CRASHED -> R.string.core_hint_retry
+            CoreManager.State.STOPPING -> R.string.core_hint_stopping
+        }
+        val tintRes = when (state) {
+            CoreManager.State.RUNNING -> R.color.color_success
+            CoreManager.State.STARTING, CoreManager.State.STOPPING -> R.color.color_warning
+            CoreManager.State.CRASHED -> R.color.color_error
+            CoreManager.State.STOPPED -> R.color.text_secondary
         }
 
-        btnSlimCache.setOnClickListener {
-            if (CoreManager.currentState != CoreManager.State.RUNNING) {
-                Toast.makeText(this, "请先启动代理核心后再执行瘦身", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
+        tvCoreTitle.setText(titleRes)
+        tvCoreSubtitle.setText(hintRes)
+        ivCoreIcon.setColorFilter(ContextCompat.getColor(this, tintRes))
+        cardCore.isEnabled = state != CoreManager.State.STOPPING
+        cardCore.alpha = if (cardCore.isEnabled) 1f else 0.6f
+        cardMetrics.visibility = if (state == CoreManager.State.RUNNING) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+
+        when (state) {
+            CoreManager.State.CRASHED -> tvCoreDetail.setText(R.string.home_core_fail_closed)
+            CoreManager.State.RUNNING -> updateVpnUi()
+            else -> tvCoreDetail.setText(R.string.home_core_idle_detail)
+        }
+
+        updateCacheSummary()
+    }
+
+    private fun updateVpnUi() {
+        if (CoreManager.currentState != CoreManager.State.RUNNING) return
+
+        when (VpnController.state) {
+            VpnController.State.RUNNING -> {
+                tvCoreSubtitle.setText(R.string.home_core_vpn_active)
+                tvCoreDetail.setText(R.string.home_core_vpn_detail)
             }
-
-            AlertDialog.Builder(this)
-                .setTitle(R.string.cache_slim_dialog_title)
-                .setMessage(R.string.cache_slim_dialog_msg)
-                .setPositiveButton(R.string.dialog_confirm) { _, _ ->
-                    CoreManager.slimCache { success, msg ->
-                        if (success) {
-                            Toast.makeText(this, "瘦身任务已在后台执行", Toast.LENGTH_SHORT).show()
-                            tvCacheSummaryInline.postDelayed({ updateCacheSummary() }, 3000)
-                        } else {
-                            Toast.makeText(this, "启动瘦身失败: $msg", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }
-                .setNegativeButton(R.string.dialog_cancel, null)
-                .show()
-        }
-
-        btnClearCache.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle(R.string.cache_clear_dialog_title)
-                .setMessage(R.string.cache_clear_dialog_msg)
-                .setPositiveButton(R.string.dialog_confirm) { _, _ ->
-                    if (CoreManager.currentState == CoreManager.State.RUNNING) {
-                        CoreManager.clearCache { success, deleted, freed ->
-                            if (success) {
-                                val freedStr = formatSize(freed)
-                                Toast.makeText(this, "清空完成: 已删除 $deleted 个文件，释放 $freedStr", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(this, "清空缓存失败，请检查核心日志", Toast.LENGTH_SHORT).show()
-                            }
-                            updateCacheSummary()
-                        }
-                    } else {
-                        // Offline manual deletion
-                        Thread {
-                            val cacheDir = getGbfCacheDir()
-                            var deleted = 0
-                            var freed = 0L
-                            if (cacheDir.exists()) {
-                                cacheDir.walkBottomUp().forEach { f ->
-                                    if (f.isFile) {
-                                        deleted++
-                                        freed += f.length()
-                                        f.delete()
-                                    } else if (f != cacheDir) {
-                                        f.delete()
-                                    }
-                                }
-                            }
-                            val freedStr = formatSize(freed)
-                            runOnUiThread {
-                                Toast.makeText(this, "清空完成: 已删除 $deleted 个文件，释放 $freedStr", Toast.LENGTH_LONG).show()
-                                updateCacheSummary()
-                            }
-                        }.start()
-                    }
-                }
-                .setNegativeButton(R.string.dialog_cancel, null)
-                .show()
+            VpnController.State.STARTING -> {
+                tvCoreSubtitle.setText(R.string.home_core_vpn_starting)
+                tvCoreDetail.setText(R.string.home_core_vpn_detail)
+            }
+            VpnController.State.STOPPED -> {
+                tvCoreSubtitle.setText(R.string.home_core_vpn_stopped)
+                tvCoreDetail.setText(R.string.home_core_idle_detail)
+            }
+            VpnController.State.ERROR -> {
+                val error = VpnController.lastError ?: "未知错误"
+                tvCoreSubtitle.text = getString(R.string.home_core_vpn_error, error)
+                tvCoreDetail.text = getString(R.string.home_core_vpn_error_detail, error)
+            }
         }
     }
 
-    private fun exportCacheToDownload(cacheDir: File) {
-        Thread {
-            try {
-                val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
-                val targetDir = File(downloadDir, "GBF_Cache")
-                targetDir.mkdirs()
-
-                var copied = 0
-                if (cacheDir.exists()) {
-                    cacheDir.copyRecursively(targetDir, overwrite = true) { _, _ ->
-                        OnErrorAction.SKIP
-                    }
-                    val (count, _) = getDirStats(targetDir)
-                    copied = count
-                }
-
-                runOnUiThread {
-                    Toast.makeText(this, "成功导出 $copied 个缓存文件到: ${targetDir.absolutePath}", Toast.LENGTH_LONG).show()
-                }
-            } catch (e: Throwable) {
-                runOnUiThread {
-                    Toast.makeText(this, "导出缓存失败: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        }.start()
-    }
-
-    private fun launchTargetBrowser(target: BrowserTarget) {
-        when (val result = browserLauncher.launch(this, target)) {
-            is LaunchResult.Success -> {
-                // Browser launched successfully
-            }
-            is LaunchResult.NotInstalled -> {
-                Toast.makeText(
-                    this,
-                    String.format(Locale.US, "%s (%s) 未安装", target.name, result.packageName),
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-            is LaunchResult.Failure -> {
-                Toast.makeText(
-                    this,
-                    String.format(Locale.US, "启动失败: %s", result.reason),
-                    Toast.LENGTH_LONG
-                ).show()
-            }
+    private fun updateMetricsUi(metrics: CoreManager.CoreMetrics) {
+        tvMetricPid.text = if (metrics.isRunning) {
+            getString(R.string.metrics_pid_format, metrics.pid, metrics.uptimeSeconds)
+        } else {
+            getString(R.string.metrics_pid_placeholder)
         }
+        tvMetricRamCache.text = getString(
+            R.string.metric_ram_format,
+            metrics.ramItems,
+            metrics.ramMb
+        )
+        tvMetricHits.text = getString(
+            R.string.metric_hits_format,
+            metrics.ramHits,
+            metrics.diskHits
+        )
+        tvMetricRequests.text = getString(
+            R.string.metric_requests_format,
+            metrics.totalAssets,
+            metrics.totalApis
+        )
+        tvMetricReuse.text = getString(
+            R.string.metric_reuse_format,
+            metrics.reusedConnections,
+            metrics.reuseRatePercent
+        )
     }
 
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
+                != PackageManager.PERMISSION_GRANTED
+            ) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
             }
         }
@@ -653,108 +318,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateStateUi(state: CoreManager.State) {
-        tvStatusBadge.text = state.name
-
-        val (colorRes, btnText, btnColorRes) = when (state) {
-            CoreManager.State.RUNNING -> Triple(R.color.color_success, getString(R.string.btn_stop_proxy), R.color.color_error)
-            CoreManager.State.STARTING -> Triple(R.color.color_warning, "启动中...", R.color.color_warning)
-            CoreManager.State.STOPPING -> Triple(R.color.color_warning, "停止中...", R.color.color_warning)
-            CoreManager.State.CRASHED -> Triple(R.color.color_error, "重启代理核心", R.color.color_success)
-            CoreManager.State.STOPPED -> Triple(R.color.color_stopped, getString(R.string.btn_start_proxy), R.color.color_success)
-        }
-
-        tvStatusBadge.setBackgroundColor(ContextCompat.getColor(this, colorRes))
-        btnToggleService.text = btnText
-        btnToggleService.setBackgroundColor(ContextCompat.getColor(this, btnColorRes))
-        btnToggleService.isEnabled = state != CoreManager.State.STOPPING && state != CoreManager.State.STARTING
-
-        // Update GBF Proxy Status badge and detail
-        when (state) {
-            CoreManager.State.RUNNING -> {
-                tvProxyBadge.text = getString(R.string.proxy_normal)
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_proxy_ok))
-                tvProxyDetail.text = getString(R.string.proxy_detail_normal)
-            }
-            CoreManager.State.CRASHED -> {
-                tvProxyBadge.text = getString(R.string.proxy_crashed)
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_error))
-                tvProxyDetail.text = getString(R.string.proxy_detail_unavailable)
-            }
-            else -> {
-                tvProxyBadge.text = getString(R.string.proxy_unavailable)
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_proxy_off))
-                tvProxyDetail.text = getString(R.string.proxy_detail_unavailable)
-            }
-        }
-
-        if (state == CoreManager.State.STOPPED) {
-            tvPidUptime.text = "PID: -- | 运行时间: 0.0s"
-        }
-
-        updateVpnUi()
-
-        // Whenever Core reaches RUNNING or changes state, refresh cache summary
-        updateCacheSummary()
-    }
-
-    private fun updateVpnUi() {
-        if (VpnController.state == VpnController.State.ERROR) {
-            tvProxyBadge.text = "VPN ERROR"
-            tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_error))
-            tvProxyDetail.text = VpnController.lastError ?: "VPN 启动失败"
-            return
-        }
-        if (CoreManager.currentState != CoreManager.State.RUNNING) return
-
-        when (VpnController.state) {
-            VpnController.State.RUNNING -> {
-                tvProxyBadge.text = "VPN ACTIVE"
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_proxy_ok))
-                tvProxyDetail.text = "VPN 已启用 | 仅代理已勾选浏览器流量，其余应用直连"
-            }
-            VpnController.State.STARTING -> {
-                tvProxyBadge.text = "VPN STARTING"
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_warning))
-                tvProxyDetail.text = "正在建立 VPN 隧道..."
-            }
-            VpnController.State.ERROR -> {
-                tvProxyBadge.text = "VPN ERROR"
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_error))
-                tvProxyDetail.text = VpnController.lastError ?: "VPN 启动失败"
-            }
-            VpnController.State.STOPPED -> {
-                tvProxyBadge.text = "VPN STOPPED"
-                tvProxyBadge.setBackgroundColor(ContextCompat.getColor(this, R.color.color_proxy_off))
-                tvProxyDetail.text = "代理核心已运行，但 VPN 未启用"
-            }
-        }
-    }
-
-    private fun updateMetricsUi(m: CoreManager.CoreMetrics) {
-        if (m.isRunning) {
-            tvPidUptime.text = String.format(Locale.US, "PID: %d | 运行时间: %.1fs", m.pid, m.uptimeSeconds)
-        }
-        tvMetricRamCache.text = String.format(Locale.US, "RAM: %d 条目 (%.2f MB)", m.ramItems, m.ramMb)
-        tvMetricHits.text = String.format(Locale.US, "命中: RAM %d / 磁盘 %d", m.ramHits, m.diskHits)
-        tvMetricRequests.text = String.format(Locale.US, "静态: %d | API: %d (活跃: %d)", m.totalAssets, m.totalApis, m.activeApiCount)
-        tvMetricReuse.text = String.format(Locale.US, "H2 复用: %d (%.1f%%)", m.reusedConnections, m.reuseRatePercent)
-    }
-
-    private fun renderLogs() {
-        val logs = CoreManager.getLogs()
-        if (logs.isNotEmpty()) {
-            tvLogContent.text = logs.joinToString("\n")
-            svLogs.post {
-                svLogs.fullScroll(ScrollView.FOCUS_DOWN)
-            }
-        }
-    }
-
     override fun onDestroy() {
         CoreManager.removeStateListener(stateListener)
         CoreManager.removeMetricsListener(metricsListener)
-        CoreManager.removeLogListener(logListener)
         VpnController.removeListener(vpnListener)
         super.onDestroy()
     }

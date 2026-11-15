@@ -1,6 +1,8 @@
 <resources>
     <string name="app_name">GBF Cache</string>
     <string name="app_subtitle">Go Core 本地静态缓存与透明代理</string>
+    <string name="navigate_back">返回</string>
+    <string name="navigate_open">打开</string>
 
     <!-- Core & Proxy Status -->
     <string name="status_daemon_title">Go Core 守护进程</string>
@@ -11,6 +13,26 @@
     <string name="proxy_detail_normal">127.0.0.1:8124 正常监听 | 6 条 GBF 规则代理，其余 DIRECT</string>
     <string name="proxy_detail_unavailable">127.0.0.1:8124 离线 | Fail-Closed 机制生效，GBF 流量安全拦截防止直连泄漏</string>
     <string name="ports_summary">数据面 127.0.0.1:8124 | 控制面 127.0.0.1:8125</string>
+
+    <string name="home_core_icon_desc">代理核心</string>
+    <string name="core_state_stopped">已停止</string>
+    <string name="core_state_running">运行中</string>
+    <string name="core_state_starting">启动中</string>
+    <string name="core_state_stopping">停止中</string>
+    <string name="core_state_crashed">启动失败</string>
+    <string name="core_hint_start">点此启动</string>
+    <string name="core_hint_stop">点此停止</string>
+    <string name="core_hint_starting">正在启动核心...</string>
+    <string name="core_hint_stopping">正在停止核心...</string>
+    <string name="core_hint_retry">点此重试</string>
+    <string name="home_core_idle_detail">127.0.0.1:8124 · 控制端口 8125</string>
+    <string name="home_core_fail_closed">Fail-Closed：GBF 流量已安全拦截</string>
+    <string name="home_core_vpn_active">点此停止 · VPN 已启用</string>
+    <string name="home_core_vpn_starting">点此停止 · VPN 正在启动</string>
+    <string name="home_core_vpn_stopped">点此停止 · VPN 未启用</string>
+    <string name="home_core_vpn_error">点此停止 · VPN 错误：%1$s</string>
+    <string name="home_core_vpn_detail">仅代理已选浏览器 · 127.0.0.1:8124</string>
+    <string name="home_core_vpn_error_detail">VPN 启动失败：%1$s</string>
 
     <!-- Actions -->
     <string name="btn_start_proxy">启动代理核心</string>
@@ -26,7 +48,9 @@
     <string name="qs_tile_vpn_permission">请先在 App 内授权 VPN</string>
 
     <!-- Browser Section -->
+    <string name="title_browser_scope">浏览器代理范围</string>
     <string name="section_browser_title">浏览器代理范围</string>
+    <string name="browser_scope_summary_title">当前代理范围</string>
     <string name="browser_scanning">正在扫描已安装浏览器...</string>
     <string name="browser_selected_count">已选择 %1$d / %2$d 个浏览器</string>
     <string name="browser_selected_count_with_restart">已选择 %1$d / %2$d 个浏览器\n%3$s</string>
@@ -35,16 +59,28 @@
     <string name="browser_none_installed">未发现可用的浏览器</string>
     <string name="browser_refreshed">已刷新浏览器列表</string>
     <string name="browser_open">打开</string>
+    <string name="browser_select_all">全选</string>
+    <string name="browser_clear_selection">清空选择</string>
     <string name="btn_refresh_browsers">刷新浏览器列表</string>
+    <string name="browser_ca_hint_title">CA 证书</string>
+    <string name="browser_ca_hint_desc">安装 CA 后，代理才能缓存 HTTPS 素材</string>
     <string name="ca_status_unknown">CA 证书：尚未生成（启动核心后自动生成）</string>
     <string name="btn_install_ca">安装 CA 证书</string>
     <string name="btn_export_ca">导出 CA 证书</string>
 
     <!-- Cache Management -->
+    <string name="title_cache_management">缓存管理</string>
     <string name="section_cache_mgmt_title">静态缓存管理与维护</string>
+    <string name="cache_summary_title">缓存概览</string>
+    <string name="cache_stats_loading">正在统计本地缓存...</string>
+    <string name="cache_summary_format">本地缓存：%1$d 个文件 · %2$s</string>
+    <string name="cache_path_label">缓存路径</string>
     <string name="btn_open_cache_dir">查看缓存目录</string>
     <string name="btn_clear_cache">清空全部缓存</string>
     <string name="btn_slim_cache">智能缓存瘦身</string>
+    <string name="cache_actions_title">维护操作</string>
+    <string name="cache_refresh">刷新统计</string>
+    <string name="cache_preferences_title">性能与缓存偏好</string>
     <string name="cache_dir_dialog_title">静态缓存目录信息</string>
     <string name="cache_dir_summary">本地路径:\n%1$s\n\n文件统计:\n共 %2$d 个素材文件 | 占用 %3$s</string>
     <string name="cache_copy_path">复制完整路径</string>
@@ -64,7 +100,82 @@
     <string name="pref_prefetch_desc">在后台自动解析页面静态依赖并平滑预拉取。在移动网络或部分机型上可能带来额外开销，默认关闭以确保流畅稳定。</string>
 
     <!-- Metrics & Logs -->
+    <string name="title_logs">日志</string>
     <string name="section_metrics_title">运行指标与缓存监控</string>
+    <string name="metrics_pid_placeholder">PID -- · 运行时间 0.0s</string>
+    <string name="metrics_pid_format">PID %1$d · 运行时间 %2$.1fs</string>
+    <string name="metric_ram_label">RAM 缓存</string>
+    <string name="metric_hits_label">缓存命中</string>
+    <string name="metric_requests_label">请求统计</string>
+    <string name="metric_reuse_label">H2 复用</string>
+    <string name="metric_ram_format">%1$d 条 · %2$.2f MB</string>
+    <string name="metric_hits_format">RAM %1$d · 磁盘 %2$d</string>
+    <string name="metric_requests_format">静态 %1$d · API %2$d</string>
+    <string name="metric_reuse_format">%1$d 次 · %2$.1f%%</string>
+    <string name="metric_value_placeholder">--</string>
     <string name="section_logs_title">核心运行日志</string>
     <string name="logs_clear">清空</string>
+    <string name="logs_copy">复制</string>
+    <string name="logs_export">导出</string>
+    <string name="logs_empty">暂无日志</string>
+    <string name="logs_copied">日志已复制到剪贴板</string>
+    <string name="logs_export_filename">gbf-core.log</string>
+    <string name="logs_export_success">日志已导出</string>
+    <string name="logs_export_failed">日志导出失败：%1$s</string>
+
+    <!-- Certificate -->
+    <string name="title_certificate">证书</string>
+    <string name="cert_status_title">CA 证书状态</string>
+    <string name="cert_status_format">状态：%1$s</string>
+    <string name="cert_subject_format">证书：%1$s</string>
+    <string name="cert_status_none">尚未生成</string>
+    <string name="cert_status_trusted">已信任</string>
+    <string name="cert_status_untrusted">未信任</string>
+    <string name="cert_hint">启动核心后会自动生成 CA 证书。安装为用户 CA 后，GBF 的 HTTPS 静态素材才能被缓存。</string>
+    <string name="cert_install_help">安装时请按系统提示确认证书名称“GBF Local Accelerator”。</string>
+    <string name="cert_export_help">如果系统不支持直接安装，可先导出到 Download 再手动安装。</string>
+
+    <!-- Settings -->
+    <string name="title_settings">设置</string>
+    <string name="settings_permissions_title">权限与系统</string>
+    <string name="settings_notification_title">通知权限</string>
+    <string name="settings_notification_desc">核心运行时显示前台服务通知</string>
+    <string name="settings_battery_title">电池优化</string>
+    <string name="settings_battery_desc">避免系统在后台限制核心运行</string>
+    <string name="settings_vpn_title">VPN 权限</string>
+    <string name="settings_vpn_desc">启动代理核心需要系统 VPN 授权</string>
+    <string name="settings_app_title">应用设置</string>
+    <string name="settings_app_desc">打开系统应用信息页</string>
+    <string name="settings_ports_title">核心端口</string>
+    <string name="settings_ports_desc">仅在本机监听，不对外网开放</string>
+    <string name="settings_data_port">数据端口</string>
+    <string name="settings_control_port">控制端口</string>
+    <string name="settings_grant">授权</string>
+    <string name="settings_granted">已授权</string>
+    <string name="settings_open">打开</string>
+    <string name="settings_go_settings">去设置</string>
+    <string name="settings_notification_denied">未授权</string>
+    <string name="settings_battery_ok">已忽略优化</string>
+    <string name="settings_battery_pending">未设置</string>
+    <string name="settings_vpn_ready">已授权</string>
+    <string name="settings_vpn_not_ready">未授权</string>
+
+    <!-- Help -->
+    <string name="title_help">帮助</string>
+    <string name="help_quick_start_title">快速上手</string>
+    <string name="help_quick_start_body">1. 在“浏览器代理范围”中勾选需要代理的浏览器。\n2. 在“证书”页安装 CA 证书。\n3. 返回首页，点击“代理核心”卡片启动。\n4. 如需从快捷设置控制，可添加“GBF Cache”磁贴。</string>
+    <string name="help_notes_title">注意事项</string>
+    <string name="help_notes_body">• 仅勾选的浏览器流量会经过代理，其他应用直连。\n• 修改浏览器范围后，需要重启 VPN 才会生效。\n• SkyLeap 对新安装的用户 CA 支持有限，可能需要系统级 CA。\n• CA 私钥仅保存在本机，请勿分享证书文件。</string>
+    <string name="help_troubleshooting_title">常见问题</string>
+    <string name="help_troubleshooting_body">• 找不到浏览器：确认已安装浏览器并刷新列表。\n• 无法启动：检查 VPN 权限和至少一个已选浏览器。\n• 缓存不增长：确认目标浏览器已勾选，并已安装 CA。\n• 需要更多帮助：查看项目 README 或日志页。</string>
+
+    <!-- About -->
+    <string name="title_about">关于</string>
+    <string name="about_version_format">版本 %1$s (%2$d)</string>
+    <string name="about_description">GBF Cache 是面向 Android 的 Granblue Fantasy 静态资源缓存与透明代理工具。</string>
+    <string name="about_components_title">开源组件</string>
+    <string name="about_components_body">• CMFA core（GPL-3.0）\n• Go Core\n• AndroidX AppCompat</string>
+    <string name="about_links_title">项目链接</string>
+    <string name="about_github">GitHub 项目主页</string>
+    <string name="about_license">请遵守相关开源许可证与游戏服务条款。</string>
 </resources>

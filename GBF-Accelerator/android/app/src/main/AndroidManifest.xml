@@ -47,6 +47,41 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.BrowserScopeActivity"
+            android:exported="false"
+            android:label="@string/title_browser_scope" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.CacheManagementActivity"
+            android:exported="false"
+            android:label="@string/title_cache_management" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.LogsActivity"
+            android:exported="false"
+            android:label="@string/title_logs" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.CertificateActivity"
+            android:exported="false"
+            android:label="@string/title_certificate" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.SettingsActivity"
+            android:exported="false"
+            android:label="@string/title_settings" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.HelpActivity"
+            android:exported="false"
+            android:label="@string/title_help" />
+
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.AboutActivity"
+            android:exported="false"
+            android:label="@string/title_about" />
+
         <service
             android:name="com.sagisawa.gbfaccelerator.ui.ProxyTileService"
             android:exported="true"

@@ -10,8 +10,8 @@ android {
         applicationId = "com.sagisawa.gbfaccelerator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.1.3"
+        versionCode = 100
+        versionName = "1.0.0"
     }
 
     buildTypes {

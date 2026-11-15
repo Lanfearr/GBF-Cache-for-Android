@@ -98,6 +98,15 @@ object CoreManager {
 
     fun getLogs(): List<String> = logBuffer.toList()
 
+    fun clearLogs() {
+        logBuffer.clear()
+        mainHandler.post {
+            for (listener in logListeners) {
+                listener("")
+            }
+        }
+    }
+
     fun logSystem(line: String) {
         appendLog(line)
     }

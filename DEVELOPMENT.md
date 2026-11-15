@@ -118,17 +118,17 @@ CMFA 的 `TunService` 会：
 - 绝不加入 `com.sagisawa.gbfaccelerator`。
 - 通过 `protect(fd)` 保护 mihomo 出站。
 
-### 4.3 保留上游完整 UI
+### 4.3 Clash Meta 风格分页面 UI
 
-保留原有 5 个区块：
+采用 AppCompat + XML 的深色卡片布局，不引入 Compose/Material 依赖。首页保留三张主卡片：
 
-1. Core/Proxy 状态
-2. 目标浏览器
-3. 缓存管理
-4. 性能偏好
-5. 指标与日志
+1. 代理核心卡片：点击启停，运行中时在下方展开“运行指标与缓存监控”。
+2. 浏览器代理范围卡片：显示已选/总数，点击进入独立页面。
+3. 静态缓存管理与维护卡片：显示文件数与占用，点击进入独立页面。
 
-状态卡片复用原有代理徽章显示 VPN 状态；`CoreService` 现在同时承担 Go Core 子进程管理和 VpnService TUN 生命周期。
+底部提供日志、证书、设置、帮助、关于入口。浏览器、缓存操作与偏好、CA、日志、权限设置均拆分为独立 Activity；除 `MainActivity` 与 `ProxyTileService` 外，新页面全部 `exported=false`。
+
+`CoreService` 现在同时承担 Go Core 子进程管理和 VpnService TUN 生命周期。
 
 ### 4.4 只代理选中的浏览器
 
@@ -138,7 +138,7 @@ CMFA 的 `TunService` 会：
 - App 自身和 GBF core 自动绕过。
 - 避免全局 VPN 带来的兼容性和回环问题。
 
-`BrowserCatalog` 通过 `Intent.ACTION_VIEW` + `https` + `CATEGORY_BROWSABLE` 查询浏览器，并以复选框列表展示。首次运行默认全选，选择结果保存在 `AppPreferences`。VPN 运行期间修改选择，需要重启 VPN 后生效。SkyLeap 会被显式列为候选，但当前不支持；首次默认全选时需手动取消。
+`BrowserCatalog` 通过 `Intent.ACTION_VIEW` + `https` + `CATEGORY_BROWSABLE` 查询浏览器，并在 `BrowserScopeActivity` 中以复选框列表展示。支持全选、清空选择、刷新列表与逐行打开。首次运行默认全选，选择结果保存在 `AppPreferences`。VPN 运行期间修改选择会显示重启提示，需要重启 VPN 后生效。SkyLeap 会被显式列为候选，但当前不支持；首次默认全选时需手动取消。
 
 ### 4.5 预编译原生库
 
@@ -168,16 +168,25 @@ CMFA release APK 已包含 arm64 的 `libclash.so` 和 `libbridge.so`。直接�
 android/app/src/main/java/com/sagisawa/gbfaccelerator/
 ├─ GbfApplication.kt              # Global.init(this)
 ├─ core/
-│  ├─ CoreManager.kt              # 原有：启动/停止 libgbfcore.so
-│  ├─ CoreService.kt              # 修改：VpnService + Go Core 前台服务
-│  ├─ VpnController.kt            # 新增：VPN 状态
+│  ├─ CoreManager.kt              # 核心启停、指标与日志缓冲区
+│  ├─ CoreService.kt              # VpnService + Go Core 前台服务
+│  ├─ VpnController.kt            # VPN 状态
+│  ├─ CacheStats.kt               # 缓存目录、文件数与占用统计
 │  └─ CoreControlReceiver.kt
 ├─ cert/
-│  └─ CaCertManager.kt            # 原有：CA 检测/安装/导出
+│  └─ CaCertManager.kt            # CA 检测/安装/导出
 ├─ ui/
-│  ├─ MainActivity.kt             # 修改：VPN 权限、CA 按钮
-│  └─ ProxyTileService.kt         # 新增：快捷设置磁贴
-└─ patch/                         # 原有：浏览器发现/启动
+│  ├─ MainActivity.kt             # 首页三卡片、核心启停、指标与摘要
+│  ├─ BasePageActivity.kt         # 子页面统一 Toolbar/返回
+│  ├─ BrowserScopeActivity.kt     # 浏览器代理范围
+│  ├─ CacheManagementActivity.kt  # 缓存统计、清理、瘦身与偏好
+│  ├─ CertificateActivity.kt      # CA 安装/导出
+│  ├─ LogsActivity.kt             # 日志清空/复制/导出
+│  ├─ SettingsActivity.kt         # 通知/电池/VPN/应用设置
+│  ├─ HelpActivity.kt             # 帮助
+│  ├─ AboutActivity.kt            # 关于与版本号
+│  └─ ProxyTileService.kt         # 快捷设置磁贴
+└─ patch/                         # 浏览器发现/启动
 ```
 
 ### 5.1 `GbfApplication`
@@ -276,13 +285,14 @@ enum class State { STOPPED, STARTING, RUNNING, ERROR }
 
 ### 5.4 `MainActivity`
 
-保留原有逻辑，新增：
+首页只负责核心状态、VPN 状态、运行指标与页面导航：
 
-- 复用代理徽章显示 VPN 状态。
-- 浏览器以复选框列表多选，支持刷新列表和逐行打开。
-- “安装 CA 证书”和“导出 CA 证书”按钮。
-- 启动按钮先检查至少勾选一个已安装浏览器，再调用 `VpnService.prepare()`，最后启动 `CoreService`。
-- VPN 授权 `ActivityResultLauncher`。
+- 代理核心卡片按状态显示“点此启动/停止/重试”，启动前检查至少勾选一个已安装浏览器，再调用 `VpnService.prepare()`，最后启动 `CoreService`。
+- VPN 运行状态直接显示在核心卡片副标题与说明中；`RUNNING` 时展开指标卡片。
+- 浏览器与缓存卡片分别显示摘要并跳转独立页面。
+- 底部按钮跳转日志、证书、设置、帮助、关于。
+- 通知权限与电池优化提示保留在 `onCreate`。
+- VPN 授权仍使用 `ActivityResultLauncher`。
 
 浏览器查询：
 
@@ -319,7 +329,7 @@ Clash.load(File(filesDir, "mihomo")).await()
 - `createInstallIntent(context)`：打开系统证书安装界面。
 - `exportCaCertToDownloads(context)`：导出到 Download 目录。
 
-`MainActivity.updateCaUi()` 在 `onResume()` 刷新状态。
+`CertificateActivity` 在 `onResume()` 刷新状态；`BrowserScopeActivity` 仅提供 CA 提示入口，具体安装与导出集中在证书页。
 
 ## 6. 配置说明
 

@@ -99,6 +99,32 @@ class AndroidComponentAccessTest {
     }
 
     @Test
+    fun featurePagesAreNotExported() {
+        val pages = listOf(
+            "com.sagisawa.gbfaccelerator.ui.BrowserScopeActivity",
+            "com.sagisawa.gbfaccelerator.ui.CacheManagementActivity",
+            "com.sagisawa.gbfaccelerator.ui.LogsActivity",
+            "com.sagisawa.gbfaccelerator.ui.CertificateActivity",
+            "com.sagisawa.gbfaccelerator.ui.SettingsActivity",
+            "com.sagisawa.gbfaccelerator.ui.HelpActivity",
+            "com.sagisawa.gbfaccelerator.ui.AboutActivity",
+        )
+        pages.forEach { name ->
+            val activity = component("activity", name)
+            assertEquals(
+                "$name must only be reachable through in-app navigation",
+                "false",
+                attribute(activity, "exported"),
+            )
+            assertEquals(
+                "$name must not declare an intent filter",
+                0,
+                activity.getElementsByTagName("intent-filter").length,
+            )
+        }
+    }
+
+    @Test
     fun quickSettingsTileIsProtectedBySystemPermission() {
         val service = component("service", "com.sagisawa.gbfaccelerator.ui.ProxyTileService")
         assertEquals(

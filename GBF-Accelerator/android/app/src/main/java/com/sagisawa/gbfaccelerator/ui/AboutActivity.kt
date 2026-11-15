@@ -24,6 +24,9 @@ class AboutActivity : BasePageActivity() {
                 Toast.makeText(this, "无法打开浏览器: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
+        findViewById<android.view.View>(R.id.btn_licenses).setOnClickListener {
+            startActivity(Intent(this, LicenseActivity::class.java))
+        }
     }
 
     private fun bindVersion() {

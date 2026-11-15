@@ -60,6 +60,16 @@
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:lineSpacingExtra="3dp"
+                android:text="@string/about_disclaimer"
+                android:textColor="@color/text_tertiary"
+                android:textSize="11sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
                 android:layout_marginTop="28dp"
                 android:text="@string/about_components_title"
                 android:textColor="@color/text_secondary"
@@ -80,6 +90,34 @@
                     android:text="@string/about_components_body"
                     android:textColor="@color/text_primary"
                     android:textSize="13sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/btn_licenses"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:background="@drawable/bg_card_ripple"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="18dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/about_open_source_licenses"
+                    android:textColor="@color/text_primary"
+                    android:textSize="14sp" />
+
+                <ImageView
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="@string/navigate_open"
+                    android:src="@drawable/ic_chevron_right"
+                    app:tint="@color/text_tertiary" />
             </LinearLayout>
 
             <TextView

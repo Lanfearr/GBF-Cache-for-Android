@@ -177,42 +177,6 @@ function Build-Windows {
         Copy-Item -Path $_.FullName -Destination (Join-Path $StagingDir $_.Name) -Force
     }
 
-    # Stage Android companion components as standalone release assets (on-demand download)
-    $LSPatchSrc = Join-Path $RootDir "build\lspatch\lspatch.jar"
-    if (Test-Path $LSPatchSrc) {
-        Copy-Item -Path $LSPatchSrc -Destination (Join-Path $ReleaseDir "lspatch.jar") -Force
-    }
-    $ModuleSrc = Join-Path $RootDir "android\xposed\build\outputs\apk\release\xposed-release.apk"
-    if (Test-Path $ModuleSrc) {
-        Copy-Item -Path $ModuleSrc -Destination (Join-Path $ReleaseDir "xposed-release.apk") -Force
-    }
-    $LicensesSrc = Join-Path $RootDir "tools\gbf-acc-patcher\THIRD_PARTY_LICENSES.md"
-    if (Test-Path $LicensesSrc) {
-        Copy-Item -Path $LicensesSrc -Destination (Join-Path $ReleaseDir "THIRD_PARTY_LICENSES.md") -Force
-    }
-
-    # Synchronize built tools into workspace tools/android for immediate local usage
-    $ToolsAndroidRoot = Join-Path $RootDir "tools\android"
-    if (-not (Test-Path $ToolsAndroidRoot)) {
-        New-Item -ItemType Directory -Path $ToolsAndroidRoot -Force | Out-Null
-    }
-    if (Test-Path $ModuleSrc) {
-        Copy-Item -Path $ModuleSrc -Destination (Join-Path $ToolsAndroidRoot "xposed-release.apk") -Force
-    }
-    if (Test-Path $LSPatchSrc) {
-        Copy-Item -Path $LSPatchSrc -Destination (Join-Path $ToolsAndroidRoot "lspatch.jar") -Force
-    }
-    if (Test-Path $LicensesSrc) {
-        Copy-Item -Path $LicensesSrc -Destination (Join-Path $ToolsAndroidRoot "THIRD_PARTY_LICENSES.md") -Force
-    }
-
-    $BinToolsAndroid = Join-Path $BinDir "tools\android"
-    if (Test-Path $BinToolsAndroid) {
-        if (Test-Path $ModuleSrc) {
-            Copy-Item -Path $ModuleSrc -Destination (Join-Path $BinToolsAndroid "xposed-release.apk") -Force
-        }
-    }
-
     # Stage jre-windows-x64.zip as release asset if JBR / Java 21+ is available
     $JbrCandidates = @(
         "C:\Program Files\Android\Android Studio\jbr",
@@ -260,18 +224,9 @@ function Build-Windows {
     }
 
     if ($BundleTools) {
-        Write-Host "[*] Bundling full Android tooling environment into release package..." -ForegroundColor Yellow
+        Write-Host "[*] Bundling Android platform-tools into release package..." -ForegroundColor Yellow
         $ToolsAndroidDir = Join-Path $StagingDir "tools\android"
         New-Item -ItemType Directory -Path $ToolsAndroidDir -Force | Out-Null
-        if (Test-Path $LSPatchSrc) {
-            Copy-Item -Path $LSPatchSrc -Destination (Join-Path $ToolsAndroidDir "lspatch.jar") -Force
-        }
-        if (Test-Path $ModuleSrc) {
-            Copy-Item -Path $ModuleSrc -Destination (Join-Path $ToolsAndroidDir "xposed-release.apk") -Force
-        }
-        if (Test-Path $LicensesSrc) {
-            Copy-Item -Path $LicensesSrc -Destination (Join-Path $ToolsAndroidDir "THIRD_PARTY_LICENSES.md") -Force
-        }
         if ($AdbExe) {
             $AdbDir = Split-Path $AdbExe
             $PtTargetDir = Join-Path $ToolsAndroidDir "platform-tools"
@@ -283,12 +238,6 @@ function Build-Windows {
             if (Test-Path (Join-Path $AdbDir "AdbWinUsbApi.dll")) {
                 Copy-Item (Join-Path $AdbDir "AdbWinUsbApi.dll") $PtTargetDir -Force
             }
-        }
-        $PatcherExe = Join-Path $RootDir "tools\gbf-acc-patcher\gbf-acc-patcher.exe"
-        if (Test-Path $PatcherExe) {
-            $PatcherTargetDir = Join-Path $StagingDir "tools\gbf-acc-patcher"
-            New-Item -ItemType Directory -Path $PatcherTargetDir -Force | Out-Null
-            Copy-Item $PatcherExe $PatcherTargetDir -Force
         }
     }
 
@@ -315,15 +264,6 @@ function Build-Windows {
         $UnzippedTools = Join-Path $UnzippedDistDir "tools\android"
         if (-not (Test-Path $UnzippedTools)) {
             New-Item -ItemType Directory -Path $UnzippedTools -Force | Out-Null
-        }
-        if (Test-Path $LSPatchSrc) {
-            Copy-Item -Path $LSPatchSrc -Destination (Join-Path $UnzippedTools "lspatch.jar") -Force
-        }
-        if (Test-Path $ModuleSrc) {
-            Copy-Item -Path $ModuleSrc -Destination (Join-Path $UnzippedTools "xposed-release.apk") -Force
-        }
-        if (Test-Path $LicensesSrc) {
-            Copy-Item -Path $LicensesSrc -Destination (Join-Path $UnzippedTools "THIRD_PARTY_LICENSES.md") -Force
         }
         if ($AdbExe) {
             $AdbDir = Split-Path $AdbExe

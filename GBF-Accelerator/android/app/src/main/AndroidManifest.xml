@@ -82,6 +82,11 @@
             android:exported="false"
             android:label="@string/title_about" />
 
+        <activity
+            android:name="com.sagisawa.gbfaccelerator.ui.LicenseActivity"
+            android:exported="false"
+            android:label="@string/title_license" />
+
         <service
             android:name="com.sagisawa.gbfaccelerator.ui.ProxyTileService"
             android:exported="true"

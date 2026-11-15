@@ -58,6 +58,8 @@ GBFCache/
 ├─ gbf-cache.yaml
 ├─ README.md
 ├─ DEVELOPMENT.md
+├─ LICENSE
+├─ COPYING
 └─ NOTICE
 ```
 
@@ -343,4 +345,6 @@ lib/arm64-v8a/libbridge.so
 
 ## 11. 许可证
 
-CMFA core 为 GPL-3.0；mihomo 为 MIT；GBF-Accelerator 为 MIT。最终 APK 按 GPL-3.0 分发，详见 [NOTICE](NOTICE)。
+本项目整体按 GNU GPL-3.0 分发，完整文本见根目录 [LICENSE](LICENSE) / [COPYING](COPYING)。CMFA core 为 GPL-3.0；mihomo 为 MIT；GBF-Accelerator 为 MIT；AndroidX/Kotlin 为 Apache-2.0。最终 APK 按 GPL-3.0 分发，详见 [NOTICE](NOTICE)。
+
+发布二进制时，请在 Release 页面链接对应源码 tag 和源码归档。新构建的 App 内「关于 → 开源许可证」也提供完整 GPL-3.0 文本。

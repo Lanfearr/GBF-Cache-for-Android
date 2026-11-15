@@ -10,7 +10,7 @@
 - 只接管选中的浏览器流量，其他 App 直连。
 - 不使用远程上游代理。
 - 自动发现可处理 `https` 的已安装浏览器；首次运行默认全选，支持多选。
-- 不需要 Root、LSPosed 或 FlClash。
+- 不需要 Root 或 FlClash。
 
 ### 约束
 
@@ -18,7 +18,7 @@
 - CMFA core 的 JNI 包名固定为 `com.github.kr328.clash.core.bridge`，不能改。
 - CMFA core 为 GPL-3.0。
 - 浏览器是否信任用户 CA 由其 WebView/网络栈决定，单 App 不能强制。
-- SkyLeap（`com.dena.skyleap`）不在支持范围：其 WebView/网络栈不信任用户 CA，单 App 无法注入信任配置；修改 SkyLeap 或 Root/系统 CA 不属于本方案。
+- SkyLeap（`com.dena.skyleap`）不在支持范围：其 WebView/网络栈不信任用户 CA，单 App 无法注入信任配置；修改客户端或 Root/系统 CA 不属于本方案。
 - 单 App 与 GBF core 子进程同 UID，必须通过 per-app allowlist 排除自身，避免回环。
 
 ## 2. 总体架构
@@ -184,7 +184,8 @@ android/app/src/main/java/com/sagisawa/gbfaccelerator/
 │  ├─ LogsActivity.kt             # 日志清空/复制/导出
 │  ├─ SettingsActivity.kt         # 通知/电池/VPN/应用设置
 │  ├─ HelpActivity.kt             # 帮助
-│  ├─ AboutActivity.kt            # 关于与版本号
+│  ├─ AboutActivity.kt            # 关于、免责声明与版本号
+│  ├─ LicenseActivity.kt          # 完整 GPL-3.0 许可证文本
 │  └─ ProxyTileService.kt         # 快捷设置磁贴
 └─ patch/                         # 浏览器发现/启动
 ```
@@ -471,56 +472,7 @@ $bt = "$env:LOCALAPPDATA\Android\Sdk\build-tools\35.0.0"
 
 - SkyLeap 的 WebView/网络栈不信任用户安装的 CA；其信任锚由 SkyLeap 自身决定，GBF Cache 无法强制。
 - `gbf.game.mbga.jp` 等 GBF 域名被分流到 GBF core 后，core 使用本地 CA 终止 TLS；SkyLeap 拒绝该 CA，握手失败，表现为白屏或无提示。
-- 单 App 不包含 LSPatch/Xposed，也没有 Root 系统 CA 安装能力，因此不能为 SkyLeap 增加信任锚。
-- 修改 SkyLeap 或使用 Root/系统 CA 不属于当前支持范围，并涉及客户端完整性、更新和账号风险。
+- 单 App 不包含 APK 重打包或注入能力，也没有 Root 系统 CA 安装能力，因此不能为 SkyLeap 增加信任锚。
+- 修改客户端或使用 Root/系统 CA 不属于当前支持范围，并涉及客户端完整性、更新和账号风险。
 
 若只需 SkyLeap 可用，请将其从 VPN allowlist 移除，让它直连；此时没有缓存加速。替代方案是使用实测信任用户 CA 的浏览器（如 Chrome、Via）。
-
-## 12. gbf-acc-patcher（PC 补丁工具）
-
-`GBF-Accelerator/tools/gbf-acc-patcher` 是上游 PC 端辅助工具，用于把 `SkyLeapModule` 嵌入用户自行提供的官方 SkyLeap 安装包。工具不内置或下载官方 APK，实际重打包由预置的 LSPatch Portable 完成。当前单 App 版不依赖该工具。
-
-### 12.1 环境要求
-
-- Java 21+。
-- `GBF-Accelerator/tools/gbf-acc-patcher/build/lspatch/lspatch.jar`。
-- 模块 APK，默认使用 `GBF-Accelerator/android/app/build/outputs/apk/debug/app-debug.apk`。
-- 可通过 `--java`、`--lspatch`、`--module` 覆盖默认路径。
-
-### 12.2 构建与测试
-
-在 `GBF-Accelerator/tools/gbf-acc-patcher` 下执行：
-
-```powershell
-go test -v ./patcher
-go build -o gbf-acc-patcher.exe .
-```
-
-### 12.3 使用
-
-```text
-Usage: gbf-acc-patcher.exe [options] <input.apk | input.apks | directory>
-
-Options:
-  -o, --output string   输出目录 (默认: "./output")
-  --java string         指定 Java 21+ 路径
-  --lspatch string      指定 lspatch.jar 路径
-  --module string       指定 SkyLeapModule APK 路径
-  -v, --verbose         启用详细日志输出
-  --keep-temp           保留临时工作目录 (用于调试排查)
-```
-
-常见输入：
-
-```powershell
-# Split APK Bundle (.apks / .xapk)
-.\gbf-acc-patcher.exe skyleap.apks -o ./output/
-
-# 已解压的 Split APK 文件目录
-.\gbf-acc-patcher.exe ./skyleap_splits/ -o ./output/
-
-# 单个 APK
-.\gbf-acc-patcher.exe skyleap.apk -o ./output/
-```
-
-工具只读取输入文件，解包与重打包在独立临时目录中完成；失败时会清理临时目录。第三方组件与许可证说明见 `GBF-Accelerator/tools/gbf-acc-patcher/THIRD_PARTY_LICENSES.md`。

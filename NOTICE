@@ -1,6 +1,20 @@
 GBF Cache
 Copyright (c) 2026
 
+This project is licensed under the GNU General Public License v3.0.
+The full license text is provided in LICENSE and COPYING. New Android builds
+also provide the same text under About > Open Source Licenses.
+
+Source code:
+https://github.com/Lanfearr/GBF-Cache-for-Android
+
+Corresponding source for each release is available from the Git tag linked on
+that release page, or from the repository's source archive.
+
+GBF Cache is an unofficial project. It is not affiliated with, endorsed by, or
+sponsored by Cygames, Inc. Granblue Fantasy and all related names, characters,
+and assets belong to their respective rights holders.
+
 This project combines several open-source components.
 
 ---------------------------------------------------------------------------

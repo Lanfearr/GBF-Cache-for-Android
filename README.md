@@ -1,6 +1,8 @@
 # GBF Cache（单 App 版）
 
-GBF Cache 是一个 Android 端的《Granblue Fantasy》静态资源缓存加速器。它把 **VPN 分流、mihomo 规则引擎、GBF 缓存核心和 UI** 集成在同一个 APK 中，不需要安装 FlClash，也不需要 Root 或 LSPosed。
+> **非官方项目**：GBF Cache 与 Cygames, Inc. 无关联，未获其授权、认可或赞助。Granblue Fantasy 及相关名称、角色和素材归其权利人所有。本项目仅供个人学习与本地缓存研究；使用前请自行确认是否符合游戏服务条款。
+
+GBF Cache 是一个 Android 端的《Granblue Fantasy》静态资源缓存加速器。它把 **VPN 分流、mihomo 规则引擎、GBF 缓存核心和 UI** 集成在同一个 APK 中，不需要安装 FlClash，也不需要 Root 或额外框架。
 
 > 当前仓库处于开发阶段。构建方式见 [BUILD.md](BUILD.md)，架构与实现细节见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
@@ -88,14 +90,14 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 - SkyLeap 的 WebView/网络栈不信任用户安装的 CA；单 App 无法向其他应用注入信任配置。
 - GBF 域名被分流到 GBF core 后，core 使用本地 CA 终止 TLS；SkyLeap 拒绝该 CA，握手失败，表现为白屏或无提示。
-- 让 SkyLeap 信任该 CA 需要修改 SkyLeap（LSPatch/重打包）或把 CA 安装为系统 CA（Root）。这两种方式不在单 App 支持范围内，并可能带来客户端完整性、更新和账号风险。
+- SkyLeap 的信任锚由自身决定，单 App 无法向其注入信任配置。修改客户端或安装系统 CA 不属于当前支持范围，并可能带来客户端完整性、更新和账号风险。
 
 可行替代：
 
 - 使用 Chrome、Via 或其他实测信任用户 CA 的浏览器。
 - 如需继续使用官方 SkyLeap，请将其从 VPN allowlist 中移除，让它直连；此时没有缓存加速。
 
-> 上游 SkyLeap 修补/LSPosed 说明属于上游或历史方案，不适用于本单 App 版。
+> 本项目不提供 SkyLeap 客户端修改、重打包或注入方案。
 
 ## 缓存说明
 
@@ -126,7 +128,7 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 - 确认 CA 已安装为用户 CA 并在系统设置中启用。
 - 确认系统时间正确。
 - 重新安装 CA 后重启浏览器。
-- 如果浏览器是 SkyLeap：当前不支持，见上文「SkyLeap 不支持」；不要通过修改 SkyLeap 或 Root 来规避，相关方式不在支持范围内。
+- 如果浏览器是 SkyLeap：当前不支持，见上文「SkyLeap 不支持」；请将其从 VPN allowlist 移除或改用其他浏览器。
 
 ### 缓存命中不增长
 
@@ -149,7 +151,7 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 - 在 App 内勾选其他信任用户 CA 的浏览器。
 - 在系统设置中确认 CA 已安装并启用。
-- 如果仍失败，需要浏览器补丁或 Xposed 方案；这些方案不在单 App 支持范围内。
+- 如果仍失败，请改用其他信任用户 CA 的浏览器；本项目不提供浏览器补丁或注入方案。
 
 ## 安全与隐私
 
@@ -169,13 +171,19 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 ## 许可证
 
+本项目整体按 **GNU General Public License v3.0** 分发。完整许可证文本见 [LICENSE](LICENSE) 和 [COPYING](COPYING)；新构建的 App 内也可在「关于 → 开源许可证」查看全文。
+
 本项目包含或链接以下组件：
 
 - GBF-Accelerator：MIT
 - mihomo：MIT
 - ClashMetaForAndroid core：GPL-3.0
+- AndroidX / Kotlin / kotlinx：Apache-2.0
 
-由于集成了 CMFA core，最终 APK 按 GPL-3.0 分发。源码和构建脚本见本仓库；分发二进制时需要同时提供对应源码。详见 [NOTICE](NOTICE)。
+由于集成了 CMFA core，最终 APK 按 GPL-3.0 分发。源码和构建脚本见本仓库；分发二进制时需要同时提供对应源码。Release 页面会链接对应源码 tag 和源码归档；详见 [NOTICE](NOTICE)。
+
+- v1.0.0 源码 tag：https://github.com/Lanfearr/GBF-Cache-for-Android/tree/v1.0.0
+- v1.0.0 源码归档：https://github.com/Lanfearr/GBF-Cache-for-Android/archive/refs/tags/v1.0.0.zip
 
 ## 相关文档
 

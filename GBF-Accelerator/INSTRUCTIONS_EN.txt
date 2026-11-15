@@ -127,5 +127,4 @@ Step 4: Launch Granblue Fantasy & Confirm Acceleration
 =================================================================
 For detailed documentation and source code, visit:
 https://github.com/Sagisawa/GBF-Accelerator
-Full English Guide: README.en.md
 =================================================================

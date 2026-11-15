@@ -475,3 +475,52 @@ $bt = "$env:LOCALAPPDATA\Android\Sdk\build-tools\35.0.0"
 - 修改 SkyLeap 或使用 Root/系统 CA 不属于当前支持范围，并涉及客户端完整性、更新和账号风险。
 
 若只需 SkyLeap 可用，请将其从 VPN allowlist 移除，让它直连；此时没有缓存加速。替代方案是使用实测信任用户 CA 的浏览器（如 Chrome、Via）。
+
+## 12. gbf-acc-patcher（PC 补丁工具）
+
+`GBF-Accelerator/tools/gbf-acc-patcher` 是上游 PC 端辅助工具，用于把 `SkyLeapModule` 嵌入用户自行提供的官方 SkyLeap 安装包。工具不内置或下载官方 APK，实际重打包由预置的 LSPatch Portable 完成。当前单 App 版不依赖该工具。
+
+### 12.1 环境要求
+
+- Java 21+。
+- `GBF-Accelerator/tools/gbf-acc-patcher/build/lspatch/lspatch.jar`。
+- 模块 APK，默认使用 `GBF-Accelerator/android/app/build/outputs/apk/debug/app-debug.apk`。
+- 可通过 `--java`、`--lspatch`、`--module` 覆盖默认路径。
+
+### 12.2 构建与测试
+
+在 `GBF-Accelerator/tools/gbf-acc-patcher` 下执行：
+
+```powershell
+go test -v ./patcher
+go build -o gbf-acc-patcher.exe .
+```
+
+### 12.3 使用
+
+```text
+Usage: gbf-acc-patcher.exe [options] <input.apk | input.apks | directory>
+
+Options:
+  -o, --output string   输出目录 (默认: "./output")
+  --java string         指定 Java 21+ 路径
+  --lspatch string      指定 lspatch.jar 路径
+  --module string       指定 SkyLeapModule APK 路径
+  -v, --verbose         启用详细日志输出
+  --keep-temp           保留临时工作目录 (用于调试排查)
+```
+
+常见输入：
+
+```powershell
+# Split APK Bundle (.apks / .xapk)
+.\gbf-acc-patcher.exe skyleap.apks -o ./output/
+
+# 已解压的 Split APK 文件目录
+.\gbf-acc-patcher.exe ./skyleap_splits/ -o ./output/
+
+# 单个 APK
+.\gbf-acc-patcher.exe skyleap.apk -o ./output/
+```
+
+工具只读取输入文件，解包与重打包在独立临时目录中完成；失败时会清理临时目录。第三方组件与许可证说明见 `GBF-Accelerator/tools/gbf-acc-patcher/THIRD_PARTY_LICENSES.md`。

@@ -3,8 +3,8 @@
 =================================================================
 
 [Multilingual Notice / 多言語案内]
-• English Users: This software natively supports English. Launch the app, open the Web Console (http://127.0.0.1:8125), and switch the language at the top-right corner. For full English documentation, see README.en.md
-• 日本語をご利用の方: 本ツールは日本語表示に完全対応しています。アプリ起動後、Webコンソール（http://127.0.0.1:8125）右上の言語メニューから「日本語」を選択してください。詳細な日本語ガイドは README.ja.md をご覧ください。
+• English Users: This software natively supports English. Launch the app, open the Web Console (http://127.0.0.1:8125), and switch the language at the top-right corner.
+• 日本語をご利用の方: 本ツールは日本語表示に完全対応しています。アプリ起動後、Webコンソール（http://127.0.0.1:8125）右上の言語メニューから「日本語」を選択してください。
 
 【写在前面：开源软件未签名与安全拦截说明】
 -----------------------------------------------------------------

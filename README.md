@@ -95,7 +95,7 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 - 使用 Chrome、Via 或其他实测信任用户 CA 的浏览器。
 - 如需继续使用官方 SkyLeap，请将其从 VPN allowlist 中移除，让它直连；此时没有缓存加速。
 
-> 上游 `GBF-Accelerator/README*.md` 中的 SkyLeap 修补/LSPosed 说明属于上游或历史方案，不适用于本单 App 版。
+> 上游 SkyLeap 修补/LSPosed 说明属于上游或历史方案，不适用于本单 App 版。
 
 ## 缓存说明
 

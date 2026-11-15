@@ -17,7 +17,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.sagisawa.gbfaccelerator.R
 import com.sagisawa.gbfaccelerator.core.CacheStats
@@ -26,7 +25,7 @@ import com.sagisawa.gbfaccelerator.core.CoreService
 import com.sagisawa.gbfaccelerator.core.VpnController
 import com.sagisawa.gbfaccelerator.patch.BrowserCatalog
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : BaseActivity() {
 
     private lateinit var cardCore: LinearLayout
     private lateinit var ivCoreIcon: ImageView

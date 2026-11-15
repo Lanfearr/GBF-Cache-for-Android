@@ -1,10 +1,9 @@
 package com.sagisawa.gbfaccelerator.ui
 
-import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
 import com.sagisawa.gbfaccelerator.R
 
-abstract class BasePageActivity : AppCompatActivity() {
+abstract class BasePageActivity : BaseActivity() {
 
     protected fun setupPageHeader(titleRes: Int) {
         findViewById<Toolbar>(R.id.toolbar)?.apply {

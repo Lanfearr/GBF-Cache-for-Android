@@ -62,7 +62,7 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 
 ## 安装与使用
 
-1. 安装 `GBF-Cache-1.1.0.apk`（arm64-v8a）。
+1. 安装 `GBF-Cache-1.1.2.apk`（arm64-v8a）。
 2. 打开 App，进入“浏览器代理范围”勾选目标浏览器（不要勾选 SkyLeap）。
 3. 进入“证书”页安装 CA 证书，按系统提示把证书安装为用户 CA。
 4. 返回首页，点击“代理核心”卡片，在系统弹窗中授权 VPN。
@@ -190,8 +190,8 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 由于集成了 CMFA core，最终 APK 按 GPL-3.0 分发。源码和构建脚本见本仓库；分发二进制时需要同时提供对应源码。Release 页面会链接对应源码 tag 和源码归档；详见 [NOTICE](NOTICE)。
 
-- v1.1.0 源码 tag：https://github.com/Lanfearr/GBF-Cache-for-Android/tree/v1.1.0
-- v1.1.0 源码归档：https://github.com/Lanfearr/GBF-Cache-for-Android/archive/refs/tags/v1.1.0.zip
+- v1.1.2 源码 tag：https://github.com/Lanfearr/GBF-Cache-for-Android/tree/v1.1.2
+- v1.1.2 源码归档：https://github.com/Lanfearr/GBF-Cache-for-Android/archive/refs/tags/v1.1.2.zip
 
 ## 相关文档
 

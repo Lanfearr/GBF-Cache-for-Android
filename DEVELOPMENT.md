@@ -334,7 +334,7 @@ Clash.load(File(filesDir, "mihomo")).await()
 
 ## 6. 配置说明
 
-核心配置见 [gbf-cache.yaml](gbf-cache.yaml)。
+核心配置见 [gbf-cache.yaml](android/app/src/main/assets/gbf-cache.yaml)。
 
 关键点：
 
@@ -386,30 +386,30 @@ granbluefantasy.jp
 ### 8.1 CMFA AAR
 
 ```powershell
-cd cmfa-aar
-..\gradle-8.10.2\bin\gradle.bat :core:assembleRelease :common:assembleRelease
+cd third_party/cmfa-aar
+..\..\gradle-8.10.2\bin\gradle.bat :core:assembleRelease :common:assembleRelease
 ```
 
 产物：
 
 ```text
-cmfa-aar/core/build/outputs/aar/core-release.aar
-cmfa-aar/common/build/outputs/aar/common-release.aar
+third_party/cmfa-aar/core/build/outputs/aar/core-release.aar
+third_party/cmfa-aar/common/build/outputs/aar/common-release.aar
 ```
 
-复制到 `GBF-Accelerator/android/app/libs/`。
+复制到 `android/app/libs/`。
 
 ### 8.2 APK
 
 ```powershell
-cd GBF-Accelerator/android
-..\..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug -x buildGoCore
+cd android
+..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug -x buildGoCore
 ```
 
 ### 8.3 单元测试
 
 ```powershell
-..\..\gradle-9.7.1\bin\gradle.bat :app:testDebugUnitTest -x buildGoCore
+..\gradle-9.7.1\bin\gradle.bat :app:testDebugUnitTest -x buildGoCore
 ```
 
 ### 8.4 校验

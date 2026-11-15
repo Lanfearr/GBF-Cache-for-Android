@@ -6,6 +6,14 @@ GBF Cache 是一个 Android 端的《Granblue Fantasy》静态资源缓存加速
 
 > 当前仓库处于开发阶段。构建方式见 [BUILD.md](BUILD.md)，架构与实现细节见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
+## 仓库结构
+
+- `android/`：第一方 Android App。
+- `core/`：第一方 Go 缓存核心。
+- `third_party/cmfa-aar/`：用于构建 CMFA core AAR 的最小工程。
+- `third_party/cmfa-src/`：CMFA 上游源码快照，供审计和重建参考；APK 构建不直接使用。
+- `scripts/`：统一构建脚本。
+
 > **SkyLeap 不支持**：当前单 App 版不支持 `com.dena.skyleap`。SkyLeap 不信任用户安装的 CA，单 App 无法强制其信任；TLS 握手失败会导致白屏。请使用实测信任用户 CA 的浏览器，或让 SkyLeap 直连（不加速）。原因见下文「SkyLeap 不支持」。
 
 ## 目标
@@ -175,7 +183,7 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 本项目包含或链接以下组件：
 
-- GBF-Accelerator：MIT
+- GBF-Accelerator：MIT（`licenses/GBF-Accelerator-MIT.txt`）
 - mihomo：MIT
 - ClashMetaForAndroid core：GPL-3.0
 - AndroidX / Kotlin / kotlinx：Apache-2.0
@@ -189,4 +197,4 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 - [BUILD.md](BUILD.md)：构建环境、CMFA AAR、APK 构建与验证。
 - [DEVELOPMENT.md](DEVELOPMENT.md)：架构、数据流、关键实现和测试计划。
-- [gbf-cache.yaml](gbf-cache.yaml)：内置 mihomo 配置。
+- [gbf-cache.yaml](android/app/src/main/assets/gbf-cache.yaml)：内置 mihomo 配置。

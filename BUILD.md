@@ -1,6 +1,6 @@
 # 构建文档
 
-本文说明如何从源码构建单 App 版 GBF Cache。最终产物是一个包含 GBF core、CMFA/mihomo core、VpnService 和 UI 的 arm64 APK。
+本文说明如何从源码构建单 App 版 GBF Cache。最终产物是一个包含 GBF core、CMFA/mihomo core、VpnService 和 UI 的 arm64 APK。桌面端已不再维护，本文件只描述 Android 构建。
 
 ## 1. 构建环境
 
@@ -13,7 +13,7 @@
 | Android SDK | 例如 `%LOCALAPPDATA%\Android\Sdk` |
 | Android 平台 | `platforms;android-35` |
 | Build Tools | `build-tools;35.0.0`（36.0.0 也可） |
-| Gradle | 8.10.2（cmfa-aar）/ 9.7.1（App），已解压到仓库根目录 |
+| Gradle | 8.10.2（`third_party/cmfa-aar`）/ 9.7.1（`android`），已解压到仓库根目录 |
 | Git | 2.49+ |
 | Go | 仅从源码重建 CMFA 原生库时需要 |
 
@@ -39,23 +39,30 @@ sdk.dir=C\:\\Users\\YourUsername\\AppData\\Local\\Android\\Sdk
 
 ```text
 GBFCache/
-├─ GBF-Accelerator/              # 上游 Android 工程
-│  └─ android/
-│     ├─ app/
-│     │  ├─ libs/                # 放置 CMFA AAR
-│     │  ├─ src/main/assets/     # gbf-cache.yaml
-│     │  └─ src/main/java/...    # GbfApplication / core / UI
-│     ├─ settings.gradle.kts
-│     └─ gradlew.bat
-├─ cmfa-aar/                     # CMFA core AAR 构建工程
-│  ├─ core/
-│  ├─ common/
-│  ├─ hideapi/
+├─ android/                      # 第一方 Android App
+│  ├─ app/
+│  │  ├─ libs/                   # 放置 CMFA AAR
+│  │  ├─ src/main/assets/        # gbf-cache.yaml
+│  │  └─ src/main/java/...       # GbfApplication / core / UI
 │  ├─ settings.gradle.kts
 │  └─ gradlew.bat
-├─ gradle-8.10.2/                # 已解压的 Gradle（cmfa-aar）
-├─ gradle-9.7.1/                 # 已解压的 Gradle（App）
-├─ gbf-cache.yaml
+├─ core/                         # 第一方 Go core
+│  ├─ go.mod
+│  ├─ main.go
+│  └─ ...
+├─ third_party/
+│  ├─ third_party/cmfa-aar/                  # CMFA core AAR 构建工程
+│  │  ├─ core/
+│  │  ├─ common/
+│  │  ├─ hideapi/
+│  │  ├─ settings.gradle.kts
+│  │  └─ gradlew.bat
+│  └─ cmfa-src/                  # CMFA 上游源码快照（不直接参与 APK 构建）
+├─ scripts/                      # 统一构建入口
+├─ .github/workflows/            # CI
+├─ gradle-8.10.2/                # 已解压的 Gradle（third_party/cmfa-aar）
+├─ gradle-9.7.1/                 # 已解压的 Gradle（android）
+├─ dist/                         # APK 输出
 ├─ README.md
 ├─ DEVELOPMENT.md
 ├─ LICENSE
@@ -65,16 +72,7 @@ GBFCache/
 
 ## 3. 获取源码
 
-```powershell
-git clone --depth 1 https://github.com/Sagisawa/GBF-Accelerator.git GBF-Accelerator
-```
-
-如果目录已存在但 clone 不完整：
-
-```powershell
-Remove-Item -Recurse -Force GBF-Accelerator
-git clone --depth 1 https://github.com/Sagisawa/GBF-Accelerator.git GBF-Accelerator
-```
+本仓库已包含 `android/`、`core/`、`third_party/cmfa-aar/` 和 `third_party/cmfa-src/`，无需再 clone 上游工程。首次检出后直接进入构建步骤即可。
 
 ## 4. 准备 CMFA 原生库
 
@@ -99,7 +97,7 @@ https://github.com/MetaCubeX/ClashMetaForAndroid/releases/download/v2.11.37/cmfa
 
 ```powershell
 $apk = "cmfa-2.11.37-meta-arm64-v8a-release.apk"
-$out = "cmfa-aar\core\src\main\jniLibs\arm64-v8a"
+$out = "third_party/cmfa-aar\core\src\main\jniLibs\arm64-v8a"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $apk))
@@ -117,7 +115,7 @@ try {
 校验：
 
 ```powershell
-Get-ChildItem "cmfa-aar\core\src\main\jniLibs\arm64-v8a"
+Get-ChildItem "third_party/cmfa-aar\core\src\main\jniLibs\arm64-v8a"
 ```
 
 应至少包含：
@@ -133,7 +131,7 @@ Android 15 的 16KB page size 设备要求 ELF `PT_LOAD` 的 `p_align` 为 `0x40
 
 ```powershell
 # 如果有 NDK
-& "$env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-readelf.exe" -l "cmfa-aar\core\src\main\jniLibs\arm64-v8a\libclash.so"
+& "$env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-readelf.exe" -l "third_party/cmfa-aar\core\src\main\jniLibs\arm64-v8a\libclash.so"
 ```
 
 如果 `libclash.so` / `libbridge.so` 不满足 16KB 对齐，需要从 CMFA 源码重建：
@@ -146,7 +144,7 @@ Android 15 的 16KB page size 设备要求 ELF `PT_LOAD` 的 `p_align` 为 `0x40
 
 如果 wrapper 下载超时，直接使用仓库根目录已解压的 `gradle-8.10.2` / `gradle-9.7.1`。
 
-`cmfa-aar` 是一个独立的最小 Gradle 工程：
+`third_party/cmfa-aar` 是一个独立的最小 Gradle 工程：
 
 - Gradle 8.10.2
 - AGP 8.8.0
@@ -159,23 +157,23 @@ Android 15 的 16KB page size 设备要求 ELF `PT_LOAD` 的 `p_align` 为 `0x40
 构建：
 
 ```powershell
-cd cmfa-aar
-..\gradle-8.10.2\bin\gradle.bat :common:assembleRelease :core:assembleRelease
+cd third_party/cmfa-aar
+..\..\gradle-8.10.2\bin\gradle.bat :common:assembleRelease :core:assembleRelease
 ```
 
 产物：
 
 ```text
-cmfa-aar/core/build/outputs/aar/core-release.aar
-cmfa-aar/common/build/outputs/aar/common-release.aar
+third_party/cmfa-aar/core/build/outputs/aar/core-release.aar
+third_party/cmfa-aar/common/build/outputs/aar/common-release.aar
 ```
 
 复制到 App：
 
 ```powershell
-New-Item -ItemType Directory -Force -Path "..\GBF-Accelerator\android\app\libs" | Out-Null
-Copy-Item "core\build\outputs\aar\core-release.aar" "..\GBF-Accelerator\android\app\libs\cmfa-core-release.aar" -Force
-Copy-Item "common\build\outputs\aar\common-release.aar" "..\GBF-Accelerator\android\app\libs\cmfa-common-release.aar" -Force
+New-Item -ItemType Directory -Force -Path "..\..\android\app\libs" | Out-Null
+Copy-Item "core\build\outputs\aar\core-release.aar" "..\..\android\app\libs\cmfa-core-release.aar" -Force
+Copy-Item "common\build\outputs\aar\common-release.aar" "..\..\android\app\libs\cmfa-common-release.aar" -Force
 ```
 
 ## 6. 集成到 App
@@ -226,28 +224,28 @@ Manifest：
 如果仓库已包含预编译 `libgbfcore.so`，跳过 Go 构建：
 
 ```powershell
-cd GBF-Accelerator\android
-..\..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug -x buildGoCore
+cd android
+..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug -x buildGoCore
 ```
 
 如果需要重新构建 GBF core：
 
 ```powershell
 # 需要 Go
-cd GBF-Accelerator\android
-..\..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug
+cd android
+..\gradle-9.7.1\bin\gradle.bat :app:assembleDebug
 ```
 
 产物：
 
 ```text
-GBF-Accelerator/android/app/build/outputs/apk/debug/app-debug.apk
+android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 建议重命名：
 
 ```powershell
-Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\..\dist\GBF-Cache-1.0.0.apk" -Force
+Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\dist\GBF-Cache-1.0.0.apk" -Force
 ```
 
 ## 8. 校验 APK

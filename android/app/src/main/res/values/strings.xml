@@ -174,12 +174,12 @@
     <string name="about_version_format">版本 %1$s (%2$d)</string>
     <string name="about_description">GBF Cache 是面向 Android 的 Granblue Fantasy 静态资源缓存与透明代理工具。</string>
     <string name="about_disclaimer">非官方项目，与 Cygames, Inc. 无关联，未获其授权、认可或赞助。Granblue Fantasy 及相关名称、角色和素材归其权利人所有。</string>
-    <string name="about_components_title">开源组件</string>
-    <string name="about_components_body">• CMFA core（GPL-3.0）\n• Go Core\n• AndroidX AppCompat</string>
+    <string name="about_components_title">第三方开源组件</string>
+    <string name="about_components_body">• GBF-Accelerator（MIT）\n• mihomo（GPL-3.0）\n• CMFA core（GPL-3.0）\n• AndroidX / Kotlin / kotlinx（Apache-2.0）</string>
     <string name="about_links_title">项目链接</string>
     <string name="about_github">GitHub 项目主页</string>
     <string name="about_open_source_licenses">开源许可证</string>
     <string name="about_license">本应用按 GPL-3.0 分发；请遵守相关开源许可证与游戏服务条款。</string>
     <string name="title_license">开源许可证</string>
-    <string name="license_intro">GBF Cache 整体按 GNU General Public License v3.0 分发。\n\n源码：https://github.com/Lanfearr/GBF-Cache-for-Android\n\n第三方组件：\n• GBF-Accelerator（MIT）\n• mihomo（MIT）\n• CMFA core（GPL-3.0）\n• AndroidX / Kotlin / kotlinx（Apache-2.0）\n\n以下为 GPL-3.0 完整文本。</string>
+    <string name="license_intro">GBF Cache 整体按 GNU General Public License v3.0 分发，本项目 Go Core 也按 GPL-3.0 分发。\n\n源码：https://github.com/Lanfearr/GBF-Cache-for-Android\n\n第三方组件：\n• GBF-Accelerator（MIT）\n• mihomo（GPL-3.0）\n• CMFA core（GPL-3.0）\n• AndroidX / Kotlin / kotlinx（Apache-2.0）\n\n以下为组件归属与许可证全文。</string>
 </resources>

@@ -1,0 +1,14 @@
+mihomo
+Source: https://github.com/MetaCubeX/mihomo
+Tracking branch: Alpha (as used by ClashMetaForAndroid 2.11.37)
+License: GNU General Public License v3.0
+
+mihomo is included through ClashMetaForAndroid and is used as the rule-based
+tunnel core for TUN routing, DNS, and rule matching.
+
+Upstream project note: downstream projects not affiliated with MetaCubeX
+shall not contain the word "mihomo" in their names. This project is named
+GBF Cache.
+
+The full GPL-3.0 text is provided in the application's open-source licenses
+screen and in android/app/src/main/res/raw/gpl_3_0.txt.

@@ -31,10 +31,13 @@ built on top of GBF-Accelerator.
 mihomo
 ---------------------------------------------------------------------------
 Source: https://github.com/MetaCubeX/mihomo
-License: MIT
+Branch: Alpha (as tracked by ClashMetaForAndroid)
+License: GPL-3.0
 
 mihomo is the rule-based tunnel core used for TUN routing, DNS, and
-rule matching.
+rule matching. It is included through ClashMetaForAndroid; the full GPL-3.0
+text is provided in the application and in the repository LICENSE/COPYING
+files. See licenses/mihomo.txt for attribution.
 
 ---------------------------------------------------------------------------
 ClashMetaForAndroid core
@@ -54,10 +57,14 @@ corresponding source code available under GPL-3.0, including the build
 scripts and any modifications.
 
 ---------------------------------------------------------------------------
-AndroidX / Kotlin / kotlinx
+AndroidX / Kotlin / kotlinx / purego
 ---------------------------------------------------------------------------
 AndroidX libraries: Apache License 2.0
 Kotlin and kotlinx libraries: Apache License 2.0
+purego (Go core dependency): Apache License 2.0
+
+The full Apache License 2.0 text is provided in the application and in
+licenses/Apache-2.0.txt.
 
 ---------------------------------------------------------------------------
 Local CA notice

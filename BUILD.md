@@ -245,7 +245,7 @@ android/app/build/outputs/apk/debug/app-debug.apk
 建议重命名：
 
 ```powershell
-Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\dist\GBF-Cache-1.0.0.apk" -Force
+Copy-Item "app\build\outputs\apk\debug\app-debug.apk" "..\dist\GBF-Cache-1.1.0.apk" -Force
 ```
 
 ## 8. 校验 APK

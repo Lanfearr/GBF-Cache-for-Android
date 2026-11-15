@@ -10,8 +10,8 @@ android {
         applicationId = "com.sagisawa.gbfaccelerator"
         minSdk = 26
         targetSdk = 35
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 110
+        versionName = "1.1.0"
     }
 
     buildTypes {
@@ -42,6 +42,12 @@ android {
     testOptions {
         unitTests.isReturnDefaultValues = true
     }
+
+    sourceSets {
+        getByName("main") {
+            assets.directories.add(layout.buildDirectory.dir("generated/licenseAssets").get().asFile.absolutePath)
+        }
+    }
 }
 
 dependencies {
@@ -65,6 +71,15 @@ val buildGoCore = tasks.register<Exec>("buildGoCore") {
     commandLine("go", "build", "-trimpath", "-ldflags=-s -w", "-o", file("src/main/jniLibs/arm64-v8a/libgbfcore.so").absolutePath, ".")
 }
 
+val copyLicenseAssets = tasks.register<Copy>("copyLicenseAssets") {
+    val repoRoot = rootProject.projectDir.parentFile
+    from(repoRoot.resolve("licenses")) {
+        into("licenses")
+    }
+    from(repoRoot.resolve("NOTICE"))
+    into(layout.buildDirectory.dir("generated/licenseAssets"))
+}
+
 tasks.named("preBuild") {
-    dependsOn(buildGoCore)
+    dependsOn(buildGoCore, copyLicenseAssets)
 }

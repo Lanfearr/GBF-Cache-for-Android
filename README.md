@@ -49,6 +49,7 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 - 可选 RAM 缓存和预取（移动端默认关闭）。
 - QUIC/UDP 443 拦截，强制回退到 TCP，保证缓存生效。
 - 本地 CA 证书安装入口。
+- 关于页自动检查 GitHub Release，支持应用内下载并调用系统安装更新。
 - 系统快捷设置磁贴，一键启停代理核心。
 - Clash Meta 风格深色卡片 UI：首页核心卡片、运行指标、浏览器范围、缓存管理，底部提供日志、证书、设置、帮助、关于入口。
 
@@ -62,7 +63,7 @@ App 自身和 GBF core 子进程不加入 VPN allowlist，因此它们的回源�
 
 ## 安装与使用
 
-1. 安装 `GBF-Cache-1.1.2.apk`（arm64-v8a）。
+1. 安装 `GBF-Cache-1.2.0.apk`（arm64-v8a）。
 2. 打开 App，进入“浏览器代理范围”勾选目标浏览器（不要勾选 SkyLeap）。
 3. 进入“证书”页安装 CA 证书，按系统提示把证书安装为用户 CA。
 4. 返回首页，点击“代理核心”卡片，在系统弹窗中授权 VPN。
@@ -190,8 +191,8 @@ App 会在“浏览器代理范围”页自动发现可处理 `https` 链接的�
 
 由于集成了 CMFA core，最终 APK 按 GPL-3.0 分发。源码和构建脚本见本仓库；分发二进制时需要同时提供对应源码。Release 页面会链接对应源码 tag 和源码归档；详见 [NOTICE](NOTICE)。
 
-- v1.1.2 源码 tag：https://github.com/Lanfearr/GBF-Cache-for-Android/tree/v1.1.2
-- v1.1.2 源码归档：https://github.com/Lanfearr/GBF-Cache-for-Android/archive/refs/tags/v1.1.2.zip
+- v1.2.0 源码 tag：https://github.com/Lanfearr/GBF-Cache-for-Android/tree/v1.2.0
+- v1.2.0 源码归档：https://github.com/Lanfearr/GBF-Cache-for-Android/archive/refs/tags/v1.2.0.zip
 
 ## 相关文档
 

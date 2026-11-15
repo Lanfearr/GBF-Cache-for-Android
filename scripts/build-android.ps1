@@ -70,7 +70,7 @@ if (-not (Test-Path -LiteralPath $apk)) {
     throw "APK not found: $apk"
 }
 
-$version = "1.1.2"
+$version = "1.2.0"
 $configFile = Join-Path $core "config\config.go"
 if (Test-Path -LiteralPath $configFile) {
     $match = Select-String -Path $configFile -Pattern 'AppVersion\s*=\s*"([^"]+)"' | Select-Object -First 1
